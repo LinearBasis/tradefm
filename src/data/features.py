@@ -1,0 +1,142 @@
+"""Scale-invariant feature engineering following TradeFM."""
+
+import polars as pl
+import numpy as np
+
+from src.config import PipelineConfig
+
+
+def compute_ewvwap(df: pl.DataFrame, cfg: PipelineConfig) -> pl.DataFrame:
+    """Compute EW-VWAP mid-price estimate per instrument from trade executions.
+
+    Uses exponentially-weighted volume-weighted average price with time-based halflife.
+    Result is joined back to all rows as 'mid_price'.
+    """
+    result_frames = []
+
+    for seccode in df["SECCODE"].unique().sort().to_list():
+        sec_df = df.filter(pl.col("SECCODE") == seccode).sort("NO")
+
+        time_sec = sec_df["time_sec"].to_numpy()
+        action = sec_df["ACTION"].to_numpy()
+        trade_price = sec_df["TRADEPRICE"].to_numpy()
+        volume = sec_df["VOLUME"].to_numpy()
+        nos = sec_df["NO"].to_numpy()
+
+        mid_prices = _ewvwap_numba(
+            time_sec, action, trade_price, volume, cfg.ewvwap_halflife_sec
+        )
+
+        result_frames.append(
+            pl.DataFrame({"NO": nos, "mid_price": mid_prices})
+        )
+
+    mid_df = pl.concat(result_frames)
+    return df.join(mid_df, on="NO", how="left")
+
+
+def _ewvwap_numba(
+    time_sec: np.ndarray,
+    action: np.ndarray,
+    trade_price: np.ndarray,
+    volume: np.ndarray,
+    halflife: float,
+) -> np.ndarray:
+    """Vectorized EW-VWAP computation.
+
+    For each row, mid_price = EMA(price * volume) / EMA(volume),
+    updated only on trade events (ACTION=2).
+    """
+    n = len(time_sec)
+    mid = np.full(n, np.nan, dtype=np.float64)
+
+    ema_pv = 0.0  # EMA of price * volume
+    ema_v = 0.0  # EMA of volume
+    last_trade_time = -1.0
+    initialized = False
+
+    for i in range(n):
+        if action[i] == 2 and not np.isnan(trade_price[i]):
+            p = trade_price[i]
+            v = float(volume[i])
+
+            if not initialized:
+                ema_pv = p * v
+                ema_v = v
+                initialized = True
+            else:
+                dt = max(time_sec[i] - last_trade_time, 1e-9)
+                alpha = 1.0 - 0.5 ** (dt / halflife)
+                ema_pv = alpha * p * v + (1.0 - alpha) * ema_pv
+                ema_v = alpha * v + (1.0 - alpha) * ema_v
+
+            last_trade_time = time_sec[i]
+
+        if initialized and ema_v > 0:
+            mid[i] = ema_pv / ema_v
+
+    return mid
+
+
+def compute_open_price(df: pl.DataFrame) -> pl.DataFrame:
+    """Opening price per instrument = first trade's TRADEPRICE."""
+    opens = (
+        df.filter(pl.col("ACTION") == 2)
+        .sort("NO")
+        .group_by("SECCODE")
+        .first()
+        .select(["SECCODE", pl.col("TRADEPRICE").alias("open_price")])
+    )
+    return df.join(opens, on="SECCODE", how="left")
+
+
+def compute_daily_volume(df: pl.DataFrame) -> pl.DataFrame:
+    """Total traded volume per instrument (for liquidity binning)."""
+    adv = (
+        df.filter(pl.col("ACTION") == 2)
+        .group_by("SECCODE")
+        .agg(pl.col("VOLUME").sum().alias("daily_volume"))
+    )
+    return df.join(adv, on="SECCODE", how="left")
+
+
+def build_order_features(df: pl.DataFrame, cfg: PipelineConfig) -> pl.DataFrame:
+    """Build scale-invariant features for add/cancel events.
+
+    Filters to ACTION in (0, 1) — only orders, not trades.
+    Computes per-instrument:
+      - interarrival: seconds since previous order event
+      - price_depth: (PRICE - mid_price) / mid_price
+      - log_volume: log(1 + VOLUME)
+      - price_level: (mid_price - open_price) / open_price
+      - side: 0=buy, 1=sell
+      - action: 0=add, 1=cancel
+    """
+    orders = (
+        df.filter(pl.col("ACTION").is_in([0, 1]))
+        .filter(pl.col("mid_price").is_not_null())
+        .sort(["SECCODE", "NO"])
+    )
+
+    orders = orders.with_columns(
+        # Interarrival time (per instrument)
+        interarrival=pl.col("time_sec")
+        .diff()
+        .over("SECCODE")
+        .clip(lower_bound=0.0),
+        # Normalized price depth
+        price_depth=(pl.col("PRICE") - pl.col("mid_price")) / pl.col("mid_price"),
+        # Log volume
+        log_volume=(pl.col("VOLUME").cast(pl.Float64) + 1.0).log(),
+        # Price level vs open
+        price_level=(pl.col("mid_price") - pl.col("open_price")) / pl.col("open_price"),
+        # Side: 0=buy, 1=sell
+        side=(pl.col("BUYSELL") == "S").cast(pl.Int8),
+        # Action: 0=add (ACTION=1), 1=cancel (ACTION=0)
+        order_action=pl.when(pl.col("ACTION") == 1).then(0).otherwise(1).cast(pl.Int8),
+    )
+
+    # Drop first row per instrument (interarrival=null)
+    orders = orders.filter(pl.col("interarrival").is_not_null())
+
+    return orders
