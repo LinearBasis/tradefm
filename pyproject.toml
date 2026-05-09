@@ -1,14 +1,19 @@
 [project]
 name = "tradefm"
 version = "0.1.0"
-description = "Add your description here"
+description = "Latent market representations from MOEX OrderLog event data."
 readme = "README.md"
 requires-python = ">=3.12"
+
 dependencies = [
-    "ipykernel>=7.2.0",
-    "jupyter>=1.1.1",
-    "matplotlib>=3.10.8",
-    "numpy>=2.4.4",
-    "pandas>=3.0.2",
-    "polars>=1.39.3",
+    "torch==2.10.0",
+    "numpy>=1.26,<3",
+    "pandas>=2.0,<3",
+    "polars>=1.0,<2",
+    "matplotlib>=3.8,<4",
+    "tqdm>=4.66,<5",
+    "tensorboard>=2.16,<3",
+    "ipykernel>=6.29,<8",
+    "jupyter>=1.0,<2",
+    "hftbacktest>=2.4.4",
 ]

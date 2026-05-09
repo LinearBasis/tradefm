@@ -9,10 +9,22 @@ wheels/
 # Virtual environments
 .venv
 
-# Data (large files)
+# Data (large files) — anchored to repo root only
+/data/
 data.csv
-data/processed/
 *.parquet
+*.npz
+
+# Model artifacts and run outputs
+/checkpoints/
+/runs/
+
+# External / vendored
+/market-making/
+/tradefm_code.zip*
+
+# Notes (PDFs)
+/notes/*.pdf
 
 # OS
 .DS_Store

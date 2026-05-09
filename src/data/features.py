@@ -7,15 +7,25 @@ from src.config import PipelineConfig
 
 
 def compute_ewvwap(df: pl.DataFrame, cfg: PipelineConfig) -> pl.DataFrame:
-    """Compute EW-VWAP mid-price estimate per instrument from trade executions.
+    """Compute EW-VWAP mid-price estimate per instrument per day from trade executions.
 
     Uses exponentially-weighted volume-weighted average price with time-based halflife.
+    EMA state resets at each day boundary.
     Result is joined back to all rows as 'mid_price'.
     """
     result_frames = []
 
-    for seccode in df["SECCODE"].unique().sort().to_list():
-        sec_df = df.filter(pl.col("SECCODE") == seccode).sort("NO")
+    groups = (
+        df.select(["SECCODE", "date"])
+        .unique()
+        .sort(["SECCODE", "date"])
+        .iter_rows()
+    )
+
+    for seccode, date in groups:
+        sec_df = df.filter(
+            (pl.col("SECCODE") == seccode) & (pl.col("date") == date)
+        ).sort("NO")
 
         time_sec = sec_df["time_sec"].to_numpy()
         action = sec_df["ACTION"].to_numpy()
@@ -28,11 +38,15 @@ def compute_ewvwap(df: pl.DataFrame, cfg: PipelineConfig) -> pl.DataFrame:
         )
 
         result_frames.append(
-            pl.DataFrame({"NO": nos, "mid_price": mid_prices})
+            pl.DataFrame({
+                "NO": nos,
+                "date": [date] * len(nos),
+                "mid_price": mid_prices,
+            })
         )
 
     mid_df = pl.concat(result_frames)
-    return df.join(mid_df, on="NO", how="left")
+    return df.join(mid_df, on=["NO", "date"], how="left")
 
 
 def _ewvwap_numba(
@@ -79,32 +93,32 @@ def _ewvwap_numba(
 
 
 def compute_open_price(df: pl.DataFrame) -> pl.DataFrame:
-    """Opening price per instrument = first trade's TRADEPRICE."""
+    """Opening price per instrument per day = first trade's TRADEPRICE."""
     opens = (
         df.filter(pl.col("ACTION") == 2)
         .sort("NO")
-        .group_by("SECCODE")
+        .group_by(["SECCODE", "date"])
         .first()
-        .select(["SECCODE", pl.col("TRADEPRICE").alias("open_price")])
+        .select(["SECCODE", "date", pl.col("TRADEPRICE").alias("open_price")])
     )
-    return df.join(opens, on="SECCODE", how="left")
+    return df.join(opens, on=["SECCODE", "date"], how="left")
 
 
 def compute_daily_volume(df: pl.DataFrame) -> pl.DataFrame:
-    """Total traded volume per instrument (for liquidity binning)."""
+    """Total traded volume per instrument per day (for liquidity binning)."""
     adv = (
         df.filter(pl.col("ACTION") == 2)
-        .group_by("SECCODE")
+        .group_by(["SECCODE", "date"])
         .agg(pl.col("VOLUME").sum().alias("daily_volume"))
     )
-    return df.join(adv, on="SECCODE", how="left")
+    return df.join(adv, on=["SECCODE", "date"], how="left")
 
 
 def build_order_features(df: pl.DataFrame, cfg: PipelineConfig) -> pl.DataFrame:
     """Build scale-invariant features for add/cancel events.
 
     Filters to ACTION in (0, 1) — only orders, not trades.
-    Computes per-instrument:
+    Computes per-instrument per-day:
       - interarrival: seconds since previous order event
       - price_depth: (PRICE - mid_price) / mid_price
       - log_volume: log(1 + VOLUME)
@@ -115,14 +129,14 @@ def build_order_features(df: pl.DataFrame, cfg: PipelineConfig) -> pl.DataFrame:
     orders = (
         df.filter(pl.col("ACTION").is_in([0, 1]))
         .filter(pl.col("mid_price").is_not_null())
-        .sort(["SECCODE", "NO"])
+        .sort(["SECCODE", "date", "NO"])
     )
 
     orders = orders.with_columns(
-        # Interarrival time (per instrument)
+        # Interarrival time (per instrument per day)
         interarrival=pl.col("time_sec")
         .diff()
-        .over("SECCODE")
+        .over(["SECCODE", "date"])
         .clip(lower_bound=0.0),
         # Normalized price depth
         price_depth=(pl.col("PRICE") - pl.col("mid_price")) / pl.col("mid_price"),
@@ -136,7 +150,7 @@ def build_order_features(df: pl.DataFrame, cfg: PipelineConfig) -> pl.DataFrame:
         order_action=pl.when(pl.col("ACTION") == 1).then(0).otherwise(1).cast(pl.Int8),
     )
 
-    # Drop first row per instrument (interarrival=null)
+    # Drop first row per instrument per day (interarrival=null)
     orders = orders.filter(pl.col("interarrival").is_not_null())
 
     return orders

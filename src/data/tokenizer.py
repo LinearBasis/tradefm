@@ -19,13 +19,22 @@ class BinEdges:
     liquidity: np.ndarray = field(default_factory=lambda: np.array([]))
 
 
-def calibrate_bins(df: pl.DataFrame, cfg: PipelineConfig) -> BinEdges:
+def calibrate_bins(
+    df: pl.DataFrame,
+    cfg: PipelineConfig,
+    dates: list[str] | None = None,
+) -> BinEdges:
     """Calibrate bin edges from data.
 
     - Price-related (price_depth, price_level): quantile (equal-frequency) bins
     - Log-transformed (volume, interarrival): equal-width bins in log-space
     - Outliers beyond p1/p99 clipped before calibration
+
+    If `dates` is provided, only rows matching those dates are used for calibration.
     """
+    if dates is not None:
+        df = df.filter(pl.col("date").is_in(dates))
+
     edges = BinEdges()
 
     lo = cfg.outlier_lower_pct
