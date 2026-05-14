@@ -28,12 +28,16 @@ def load_from_json(cls: type[T], path: str | Path) -> T:
 class ModelConfig:
     # --- Architecture ---
     d_model: int = 128
-    n_heads: int = 4
+    n_heads: int = 4         # Query heads
+    n_kv_heads: int = 1      # Key/Value heads for GQA. Must divide n_heads.
     n_layers: int = 4
-    d_ff: int = 512
+    d_ff: int = 512          # SwiGLU intermediate size (typically 4*d_model in Llama family)
     d_context: int = 32
     context_length: int = 512
     dropout: float = 0.1
+    # Apply RMSNorm to Q and K before SDPA (Gemma 2 / DeepSeek-V4 style).
+    # Stabilizes training, plays well with Muon. Default off → old checkpoints compatible.
+    qk_norm: bool = False
 
     # --- Vocab (derived from PipelineConfig, but stored for standalone use) ---
     vocab_size: int = 16_384
@@ -50,6 +54,13 @@ class ModelConfig:
     warmup_fraction: float = 0.05
     grad_clip_norm: float = 1.0
     val_days: int = 5  # last N days → validation (mirrors PipelineConfig)
+    # Optimizer: "adamw" (default) or "muon_hybrid" (Muon for 2D matrices + AdamW for the rest).
+    # Old configs without this field stay on AdamW.
+    optimizer: str = "adamw"
+    muon_lr: float = 0.02
+    muon_momentum: float = 0.95
+    muon_weight_decay: float = 0.01
+    muon_update_rescale: float = 0.2
 
     # --- Dataset ---
     stride: int = 256
@@ -63,7 +74,10 @@ class ModelConfig:
 @dataclass
 class HeadConfig:
     # --- Targets ---
-    tau: int = 512  # forward horizon in events
+    # Forward horizon in seconds. Reasonable values: 0.5 / 1.0 / 5.0 / 30.0.
+    # Must match PipelineConfig.tau_sec used when generating the parquets,
+    # otherwise the heads will be trained on the wrong horizon.
+    tau_sec: float = 1.0
     session_length_sec: float = 30840.0  # 18:39 - 10:05
 
     # --- Architecture ---
@@ -107,6 +121,11 @@ class PipelineConfig:
 
     # --- EW-VWAP ---
     ewvwap_halflife_sec: float = 10.0
+
+    # --- Target horizon ---
+    # Forward horizon in seconds for decision-head targets baked into parquets.
+    # Reasonable values: 0.5 / 1.0 / 5.0 / 30.0. Must match HeadConfig.tau_sec.
+    tau_sec: float = 1.0
 
     # --- Binning ---
     n_bins_price_depth: int = 16

@@ -1,6 +1,7 @@
 {
   "d_model": 64,
   "n_heads": 2,
+  "n_kv_heads": 1,
   "n_layers": 2,
   "d_ff": 128,
   "d_context": 16,

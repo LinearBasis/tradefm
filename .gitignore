@@ -22,9 +22,7 @@ data.csv
 # External / vendored
 /market-making/
 /tradefm_code.zip*
-
-# Notes (PDFs)
-/notes/*.pdf
+/tradefm.zip*
 
 # OS
 .DS_Store

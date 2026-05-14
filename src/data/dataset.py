@@ -48,6 +48,7 @@ class OrderFlowDataset(Dataset):
         # Stable instrument → id mapping from manifest (alphabetical)
         self.instrument_names = manifest["instruments"]
         self.instrument_map = {name: i for i, name in enumerate(self.instrument_names)}
+        self.manifest_tau_sec = manifest.get("tau_sec")  # None for pre-fix parquets
 
         self.windows: list[tuple[np.ndarray, np.ndarray | None, int]] = []
 
@@ -77,6 +78,10 @@ class OrderFlowDataset(Dataset):
                 targets = np.column_stack([
                     df[c].to_numpy().astype(np.float32) for c in target_cols
                 ])
+                # Floor risk/intensity to prevent log(0) outliers in MSE loss (NaN preserved).
+                # risk: ~3 bp (3 ticks moves), intensity: 1% of daily rate
+                targets[:, 1] = np.maximum(targets[:, 1], 3e-4)
+                targets[:, 2] = np.maximum(targets[:, 2], 1e-2)
 
             window_len = cfg.context_length + 1  # input + 1 target token
 
@@ -100,7 +105,7 @@ class OrderFlowDataset(Dataset):
         if targets is not None:
             # NaN → 0.0 in values; separate mask tracks validity
             t = torch.from_numpy(targets)
-            valid = ~torch.isnan(t[:, 0])  # all three are NaN together
+            valid = ~torch.isnan(t).any(dim=1)  # any-NaN-across-heads → invalid
             t = torch.nan_to_num(t, nan=0.0)
             result["target_alpha"] = t[:, 0]
             result["target_risk"] = t[:, 1]

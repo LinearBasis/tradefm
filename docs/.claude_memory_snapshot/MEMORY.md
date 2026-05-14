@@ -1,0 +1,13 @@
+- [Data scope](project_data_scope.md) — one MOEX day now, more days + markets coming
+- [Data format](project_data_format.md) — MOEX OrderLog official format: ACTION 0=cancel, 1=new, 2=trade
+- [Architecture decisions](project_architecture_decisions.md) — features, tokenization, mid-price, instrument selection
+- [Strategy direction](project_strategy_direction.md) — market making, A-S/GLFT baseline, hftbacktest for eval
+- [Market orders decision](project_market_orders_decision.md) — drop ACTION=1&PRICE=0 + their fills/cancels in OrderLog→hftbacktest converter (0.55% loss; ROSN worst at 4.4%)
+- [hftbacktest converter status](project_hftbacktest_converter_status.md) — converter built, 349M events, mid corr 0.998+ vs VWAP; ev computed in numpy (Polars Int32 overflow trap)
+- [Decision head plan](tmp_plan_decision_head.md) — two-stage: supervised multi-head (alpha/risk/intensity) → RL fine-tuning
+- [DiffQuant reference](reference_diffquant.md) — differentiable simulator for Stage 2, alternative to RL
+- [Cluster training scripts must support multi-GPU DDP](feedback_cluster_ddp.md) — torchrun, 1–8 GPUs, rank-0 logging
+- [RoPE positional encoding](project_rope_pos_encoding.md) — switched from learned abs pos_emb to RoPE 2026-05-09; old checkpoints invalid, sliding window now correct
+- [Config-driven training](feedback_config_driven.md) — hyperparams live in configs/*.json + src/config.py dataclasses, CLI is runtime-only
+- [Head targets in seconds](project_tau_sec_targets.md) — 2026-05-11 targets switched from tau events to tau_sec seconds; A-S formula dropped tau; old sequences parquets invalid
+- [No Gmail transfer](feedback_no_gmail_transfer.md) — build archives locally and stop; don't auto-send via Gmail/Drive/etc.

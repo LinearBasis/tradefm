@@ -98,7 +98,7 @@ def _process_day(
 
         sec_full = df.filter(pl.col("SECCODE") == seccode).sort("NO")
         seq = add_targets_to_orders(
-            sec_orders, sec_full, tau=512, session_length=session_len,
+            sec_orders, sec_full, tau_sec=cfg.tau_sec, session_length=session_len,
         )
 
         key = f"{seccode}_{date}"
@@ -215,6 +215,8 @@ def run_pipeline(cfg: PipelineConfig | None = None) -> BinEdges:
         "train_dates": train_dates,
         "val_dates": val_dates,
         "instruments": sorted(instruments),
+        "tau_sec": cfg.tau_sec,
+        "session_length_sec": cfg.continuous_end_sec - cfg.continuous_start_sec,
         "sequences": {},
     }
     total_tokens = 0
@@ -245,6 +247,8 @@ if __name__ == "__main__":
                         help="POLARS_MAX_THREADS in each worker")
     parser.add_argument("--raw-dir", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default=None)
+    parser.add_argument("--tau-sec", type=float, default=None,
+                        help="Forward target horizon in seconds (default: PipelineConfig.tau_sec)")
     args = parser.parse_args()
 
     cfg = PipelineConfig()
@@ -256,5 +260,7 @@ if __name__ == "__main__":
         cfg.raw_dir = args.raw_dir
     if args.output_dir is not None:
         cfg.output_dir = args.output_dir
+    if args.tau_sec is not None:
+        cfg.tau_sec = args.tau_sec
 
     run_pipeline(cfg)

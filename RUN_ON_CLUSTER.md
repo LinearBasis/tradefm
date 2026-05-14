@@ -1,98 +1,87 @@
-# Quickstart на кластере
+# Текущий запуск на кластере
 
-Архив содержит **только код** (~190 КБ): `src/`, `scripts/`, `tests/`, `docs/`, `pyproject.toml`, `uv.lock`, `CLAUDE.md`.
+Цель: получить **сравнение baseline A-S (константы) vs наша модель A-S (μ/σ/κ от голов)** на SBER. Данные (`data/raw/*`, `data/hftbacktest/*.npz`) уже на кластере; здесь только код, конфиги и эта инструкция.
 
-Допущения по данным на кластере:
-- `data/raw/OrderLog*.txt` — есть (для регенерации L3 npz и tokenized sequences)
-- `data/processed/sequences/*.parquet` — есть (после `src.data.pipeline`)
-
-Если что-то отсутствует — см. секцию «Регенерация данных» внизу.
-
-## 0. Распаковка и окружение
+## 0. Окружение
 
 ```bash
 tar xzf tradefm.tar.gz && cd tradefm
-uv sync                               # создаст .venv, поставит torch, hftbacktest, polars
+uv sync
 uv run python -c "import torch; print('cuda?', torch.cuda.is_available())"
 ```
 
-## 1. Тренировка трансформера (главная команда — 4×H100)
+## 1. Регенерация sequences (~30–60 мин)
 
-Гиперпараметры лежат в `configs/cluster.json` (создать перед запуском, см. шаблон в `configs/smoke.json`). Архитектура и ёмкости — там же.
+Старые таргеты были в **событиях**, новые — в **секундах** (`tau_sec=1.0`). Старый `data/processed/sequences/` несовместим и должен быть пересобран.
 
 ```bash
-mkdir -p logs runs
+rm -rf data/processed/sequences
+uv run python -m src.data.pipeline --n-jobs 8 --polars-threads 4
+```
+
+## 2. Трансформер (4×H100)
+
+Архитектура — Llama-family (GQA + SwiGLU + RoPE), повторяет концепции TradeFM paper. Два варианта размера; обучаем оба и сравним.
+
+**75M** (paper operating point ~72 tok/p на 4 эпохах, рекомендованный):
+```bash
+mkdir -p logs checkpoints
 CUDA_VISIBLE_DEVICES=0,1,2,3 uv run torchrun --standalone --nproc-per-node=4 \
-    -m scripts.train_transformer --config configs/cluster.json \
-    --num-workers 8 --amp bf16 --run-name xfmr_full \
-    2>&1 | tee logs/xfmr_full.log
+    -m scripts.train_transformer --config configs/base.json \
+    --num-workers 8 --amp bf16 --run-name xfmr_75m \
+    2>&1 | tee logs/xfmr_75m.log
 ```
+Артефакт: `checkpoints/transformer_75m/best.pt`.
 
-Резюм при крэше: добавить `--resume checkpoints/last.pt`.
-
-LR-скейлинг: `lr` в конфиге подобран под 1 GPU. На 4 GPU эффективный батч ×4 — либо поднять `lr` в конфиге пропорционально, либо снизить `batch_size` в конфиге до 8.
-
-TensorBoard: `uv run tensorboard --logdir runs/ --bind_all`.
-
-Артефакт: `checkpoints/best.pt` (или путь из `checkpoint_dir` в конфиге).
-
-Smoke (на ноуте/CPU, несколько шагов):
+**125M** (Chinchilla-friendly, ~43 tok/p на 4 эпохах):
 ```bash
-uv run python -m scripts.train_transformer --config configs/smoke.json \
-    --device cpu --allow-cpu --amp none --max-steps 30
+CUDA_VISIBLE_DEVICES=0,1,2,3 uv run torchrun --standalone --nproc-per-node=4 \
+    -m scripts.train_transformer --config configs/base_125m.json \
+    --num-workers 8 --amp bf16 --run-name xfmr_125m \
+    2>&1 | tee logs/xfmr_125m.log
 ```
+Артефакт: `checkpoints/transformer_125m/best.pt`.
 
-## 2. Регенерация hftbacktest npz (нужно для Exp 1)
+При крэше — `--resume <checkpoint_dir>/last.pt`.
 
-Требует `data/raw/OrderLog*.txt`.
-```bash
-mkdir -p data/hftbacktest
-uv run python -m src.data.moex_to_hftbacktest --output-dir data/hftbacktest
-```
-~10–15 мин на 5 дней × 20 инструментов = 349M событий.
+## 3. Decision heads (~часы)
 
-Валидация:
-```bash
-uv run python -m tests.validate_hftbacktest_npz --instrument SBER --date 2024-03-18
-```
+Учим μ/σ/κ поверх замороженного латента. `configs/base_heads.json` имеет `tau_sec=1.0`, должно совпадать с шагом 1. **Запустить отдельно для каждого трансформера** — в `base_heads.json` нужно прописать соответствующий `transformer_checkpoint` (или пробросить через CLI, если поддерживается).
 
-## 3. Тренировка decision heads
-
-Multi-horizon ablation (план Exp 0b). Один конфиг на τ — например `configs/heads_tau512.json`. Требует, чтобы pipeline уже разложил targets под это τ (иначе перезапустить пайплайн).
+Если решишь обучать только под один трансформер — выбери лучший по val-loss трансформер из шага 2 и подсунь его в `transformer_checkpoint`.
 
 ```bash
-for TAU in 128 256 512 1024; do
-  CUDA_VISIBLE_DEVICES=0,1,2,3 uv run torchrun --standalone --nproc-per-node=4 \
-      -m scripts.train_heads --config configs/heads_tau${TAU}.json \
-      --num-workers 8 --amp bf16 --run-name heads_tau${TAU} \
-      2>&1 | tee logs/heads_tau${TAU}.log
-done
+# Пример для 75M трансформера (правь transformer_checkpoint в base_heads.json или клонируй конфиг)
+CUDA_VISIBLE_DEVICES=0,1,2,3 uv run torchrun --standalone --nproc-per-node=4 \
+    -m scripts.train_heads --config configs/base_heads.json \
+    --num-workers 8 --amp bf16 --run-name heads_75m \
+    2>&1 | tee logs/heads_75m.log
 ```
 
-Критерий: IC(α) > 0 значимо хотя бы при одном τ.
+Артефакт: `checkpoints/heads/best_heads.pt`. **Главные метрики в логах:** `IC(α)`, `Spearman(σ)`, `Spearman(κ)`, `α_pred_std`. Если `IC(α) ≈ 0` и `α_pred_std → 0` — α-голова коллапсировала, в бэктесте её можно игнорировать.
 
-## 4. Чек-лист готовности «лучшая модель»
+## 4. Бэктесты — оба варианта на одном окне
 
-| Этап | Артефакт | Статус-команда |
-|------|----------|----------------|
-| Full train | `checkpoints/best.pt` | `python -c "import torch; ck=torch.load('checkpoints/best.pt', weights_only=False); print(ck['epoch'], ck['val_loss'])"` |
-| Heads × 4 τ | `checkpoints/heads_tau*/best_heads.pt` | grep IC в `logs/heads_tau*.log` |
-| L3 npz | `data/hftbacktest/*/2024-03-*.npz` | `ls data/hftbacktest/SBER/` |
+Сравниваем на **SBER, 2024-03-22, минуты 60–120**.
 
-## Регенерация данных (если на кластере чего-то нет)
-
-Полный конвейер из сырых OrderLog в tokenized sequences:
 ```bash
-uv run python -m src.data.pipeline                # CSV → features → tokens → sequences
+# Baseline: A-S с константами
+PYTHONPATH=. uv run python -m scripts.backtest_orig_as \
+    --instrument SBER --date 2024-03-22 --interval 60-120
+
+# Наша модель
+PYTHONPATH=. uv run python -m scripts.backtest_our_as \
+    --transformer-checkpoint checkpoints/transformer/best.pt \
+    --heads-checkpoint checkpoints/heads/best_heads.pt \
+    --instrument SBER --date 2024-03-22 --interval 60-120
 ```
-~30–60 мин в зависимости от количества дней. Артефакты:
-- `data/processed/tokens.parquet`
-- `data/processed/sequences/*.parquet` (по одному на (SECCODE, day))
+
+Результаты: `runs/backtest_orig_as/SBER_2024-03-22_060-120/summary.json` и `runs/backtest_our_as/SBER_2024-03-22_060-120/summary.json`. Ключевые поля для сравнения: `pnl`, `n_fills`, `mean_position`, `max_abs_position`.
 
 ## Подводные камни
 
-1. `bf16` бесплатный на A100/H100, выбран по умолчанию.
-2. `num-workers >= 8` важно — иначе DataLoader станет горлышком.
-3. Если OOM — снизить `batch_size` или `context_length` в конфиге. Gradient accumulation в `train_transformer.py` пока не реализован.
-4. На multi-node нужен `torchrun --rdzv-backend=c10d --rdzv-endpoint=$MASTER:29500 --nnodes=N --node-rank=$NODE_RANK ...` вместо `--standalone`.
-5. Старые чекпоинты (до перехода на RoPE 2026-05-09) несовместимы — в них есть `pos_emb.weight`, которого больше нет в архитектуре. Тренировать с нуля.
+- **LR vs число GPU**: `configs/base.json` имеет `lr=3e-4` под 1 GPU. На 4 GPU эффективный батч ×4. При нестабильном loss в первые шаги — снизить до `1e-4`; если кривая слишком плоская — поднять до `6e-4`.
+- **OOM** → уменьшить `batch_size` в конфиге (64 → 32) или `context_length` (1024 → 512).
+- **`num_workers` ≥ 8** — иначе DataLoader станет горлышком.
+- **bf16** бесплатный на H100 — оставлять.
+- **hftbacktest npz** должны лежать в `data/hftbacktest/{SECCODE}/{date}.npz`. Если их нет: `uv run python -m src.data.moex_to_hftbacktest --output-dir data/hftbacktest`.

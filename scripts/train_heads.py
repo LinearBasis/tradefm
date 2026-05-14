@@ -477,6 +477,12 @@ def main():
         print("Loading datasets...")
     train_ds = OrderFlowDataset(model_cfg, split="train", include_targets=True)
     val_ds = OrderFlowDataset(model_cfg, split="val", include_targets=True)
+    if train_ds.manifest_tau_sec is not None and train_ds.manifest_tau_sec != cfg.tau_sec:
+        raise ValueError(
+            f"tau_sec mismatch: heads config wants {cfg.tau_sec}, "
+            f"manifest was generated with {train_ds.manifest_tau_sec}. "
+            f"Regenerate sequences or align cfg.tau_sec."
+        )
     if _is_main(rank):
         print(f"Train windows: {len(train_ds):,}, Val windows: {len(val_ds):,}")
 

@@ -54,7 +54,7 @@ def main():
     heads.load_state_dict(ck_heads["heads_state_dict"])
     heads.eval()
     print(f"Heads: {sum(p.numel() for p in heads.parameters()):,} params, "
-          f"τ={head_cfg.tau}")
+          f"τ_sec={head_cfg.tau_sec}")
 
     # --- One batch from val -------------------------------------------------
     ds = OrderFlowDataset(model_cfg, split="val")
@@ -92,13 +92,13 @@ def main():
     kappa_t = kappa[:, -1]
     mid = torch.full_like(mu_t, MOCK_MID)
 
-    print(f"\nA-S quotes (mock mid={MOCK_MID}, γ={GAMMA}, τ={head_cfg.tau}):")
+    print(f"\nA-S quotes (mock mid={MOCK_MID}, γ={GAMMA}, τ_sec={head_cfg.tau_sec}):")
     print(f"{'q':>6}  {'reservation':>12}  {'half_spread':>12}  {'bid':>10}  {'ask':>10}  {'skew':>10}")
     for q_val in INVENTORY_LEVELS:
         q = torch.full_like(mu_t, q_val)
         out = avellaneda_stoikov_quotes(
             mid=mid, mu=mu_t, sigma=sigma_t, kappa=kappa_t,
-            inventory=q, gamma=GAMMA, tau=float(head_cfg.tau),
+            inventory=q, gamma=GAMMA,
         )
         # Take batch-mean for printout
         res = out["reservation"].mean().item()

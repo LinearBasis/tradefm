@@ -46,7 +46,6 @@ def main():
                    help="start-end minute offsets from first event (e.g. 60-120, 0-, 0-525)")
     # A-S formula constants
     p.add_argument("--gamma", type=float, default=0.1)
-    p.add_argument("--tau", type=float, default=512.0)
     p.add_argument("--mu", type=float, default=0.0)
     p.add_argument("--sigma", type=float, default=1e-4)
     p.add_argument("--kappa", type=float, default=1.0)
@@ -201,7 +200,7 @@ def main():
         q = torch.tensor(position)
         out = avellaneda_stoikov_quotes(
             mid=torch.tensor(mid), mu=mu, sigma=sigma, kappa=kappa,
-            inventory=q, gamma=args.gamma, tau=args.tau,
+            inventory=q, gamma=args.gamma,
         )
         bid_px = out["bid"].item()
         ask_px = out["ask"].item()
@@ -282,7 +281,7 @@ def main():
         "mean_position": float(np.mean(pos_log)) if pos_log else 0.0,
         "max_abs_position": float(max(abs(p) for p in pos_log)) if pos_log else 0.0,
         "mean_book_spread": float(np.mean([a - b for a, b in zip(ba_log, bb_log)])) if bb_log else 0.0,
-        "as_params": {"gamma": args.gamma, "tau": args.tau,
+        "as_params": {"gamma": args.gamma,
                        "mu": args.mu, "sigma": args.sigma, "kappa": args.kappa},
     }
     with open(out_dir / "summary.json", "w") as f:

@@ -43,6 +43,7 @@ from tqdm import tqdm
 
 from src.config import ModelConfig
 from src.data.dataset import OrderFlowDataset
+from src.training.muon import HybridMuonAdamW
 from src.models.transformer import OrderFlowTransformer
 
 
@@ -116,12 +117,17 @@ def _all_reduce_mean(value: float, world_size: int, device: torch.device) -> flo
 # Training utilities                                                           #
 # --------------------------------------------------------------------------- #
 
-def get_lr(step: int, warmup_steps: int, total_steps: int, base_lr: float) -> float:
-    """Cosine annealing with linear warmup."""
+def get_lr_factor(step: int, warmup_steps: int, total_steps: int) -> float:
+    """Cosine annealing with linear warmup, returned as a fraction in [0, 1]."""
     if step < warmup_steps:
-        return base_lr * step / max(warmup_steps, 1)
+        return step / max(warmup_steps, 1)
     progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
-    return base_lr * 0.5 * (1 + math.cos(math.pi * progress))
+    return 0.5 * (1 + math.cos(math.pi * progress))
+
+
+def get_lr(step: int, warmup_steps: int, total_steps: int, base_lr: float) -> float:
+    """Backward-compat scalar LR: base_lr × fraction. Used for tensorboard logging."""
+    return base_lr * get_lr_factor(step, warmup_steps, total_steps)
 
 
 def _amp_dtype(name: str | None) -> torch.dtype | None:
@@ -179,9 +185,12 @@ def train_epoch(
         input_plevels = plevels[:, :-1]
         input_liqs = liqs[:, :-1]
 
-        lr = get_lr(step, warmup_steps, total_steps, cfg.lr)
+        lr_factor = get_lr_factor(step, warmup_steps, total_steps)
         for pg in optimizer.param_groups:
-            pg["lr"] = lr
+            pg["lr"] = pg["base_lr"] * lr_factor
+        # Representative LR for logging — the AdamW base scales identically to Muon,
+        # so a single scalar (cfg.lr × factor) suffices for the TensorBoard curve.
+        lr = cfg.lr * lr_factor
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -383,10 +392,34 @@ def main():
         model = DDP(model, device_ids=[local_rank], output_device=local_rank,
                     find_unused_parameters=False)
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=cfg.lr,
-        weight_decay=cfg.weight_decay, betas=cfg.betas,
-    )
+    opt_kind = getattr(cfg, "optimizer", "adamw")
+    if opt_kind == "adamw":
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=cfg.lr,
+            weight_decay=cfg.weight_decay, betas=cfg.betas,
+        )
+    elif opt_kind == "muon_hybrid":
+        target_model = model.module if use_ddp else model
+        optimizer = HybridMuonAdamW(
+            target_model,
+            muon_lr=cfg.muon_lr,
+            muon_momentum=cfg.muon_momentum,
+            muon_weight_decay=cfg.muon_weight_decay,
+            muon_update_rescale=cfg.muon_update_rescale,
+            adamw_lr=cfg.lr,
+            adamw_weight_decay=cfg.weight_decay,
+            adamw_betas=cfg.betas,
+        )
+        if _is_main(rank):
+            n_muon = sum(p.numel() for p in optimizer.muon.param_groups[0]["params"])
+            n_adamw = sum(p.numel() for p in optimizer.adamw.param_groups[0]["params"])
+            print(f"Optimizer: muon_hybrid | Muon params: {n_muon:,} | AdamW params: {n_adamw:,}")
+    else:
+        raise ValueError(f"Unknown optimizer: {opt_kind!r} (expected 'adamw' or 'muon_hybrid')")
+
+    # Stash each group's base LR so the warmup/cosine scheduler can scale them independently.
+    for pg in optimizer.param_groups:
+        pg["base_lr"] = pg["lr"]
 
     scaler = torch.amp.GradScaler("cuda") if (amp_dtype == torch.float16) else None
 
@@ -420,9 +453,20 @@ def main():
         # DDP: state_dict keys may have "module." prefix
         sd = ck["model_state_dict"]
         target = model.module if use_ddp else model
-        target.load_state_dict(sd)
+        # strict=False so newly enabled optional modules (e.g. QK-norm)
+        # get their fresh defaults when resuming from an older checkpoint.
+        missing, unexpected = target.load_state_dict(sd, strict=False)
+        if _is_main(rank) and (missing or unexpected):
+            if missing:
+                print(f"  Resume: missing keys (fresh init): {missing}")
+            if unexpected:
+                print(f"  Resume: unexpected keys (ignored): {unexpected}")
         if "optimizer_state_dict" in ck:
-            optimizer.load_state_dict(ck["optimizer_state_dict"])
+            try:
+                optimizer.load_state_dict(ck["optimizer_state_dict"])
+            except (ValueError, KeyError, RuntimeError) as e:
+                if _is_main(rank):
+                    print(f"  Resume: optimizer state incompatible ({e!s}); starting optimizer fresh.")
         start_epoch = int(ck.get("epoch", 0)) + 1
         best_val_loss = float(ck.get("val_loss", best_val_loss))
         step = int(ck.get("step", 0))

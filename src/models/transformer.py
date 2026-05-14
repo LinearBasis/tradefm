@@ -7,6 +7,18 @@ import torch.nn.functional as F
 from src.config import ModelConfig
 
 
+class RMSNorm(nn.Module):
+    """Standard RMSNorm. Used for optional QK-norm in attention (Gemma 2 / DeepSeek-V4 style)."""
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.weight * x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+
 def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     """Apply rotary positional embedding to q or k.
 
@@ -20,53 +32,86 @@ def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch
 
 
 class CausalSelfAttention(nn.Module):
-    """Multi-head causal self-attention using F.scaled_dot_product_attention with RoPE."""
+    """Grouped-Query Causal Self-Attention with RoPE.
+
+    n_kv_heads < n_heads → K/V are smaller; groups of (n_heads // n_kv_heads)
+    Q-heads share each K/V head. n_kv_heads == n_heads recovers standard MHA.
+    """
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         assert cfg.d_model % cfg.n_heads == 0
+        assert cfg.n_heads % cfg.n_kv_heads == 0, "n_kv_heads must divide n_heads"
         self.n_heads = cfg.n_heads
+        self.n_kv_heads = cfg.n_kv_heads
+        self.n_rep = cfg.n_heads // cfg.n_kv_heads
         self.d_head = cfg.d_model // cfg.n_heads
         assert self.d_head % 2 == 0, "d_head must be even for RoPE"
-        self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model)
-        self.out_proj = nn.Linear(cfg.d_model, cfg.d_model)
+
+        self.q_proj = nn.Linear(cfg.d_model, cfg.n_heads * self.d_head, bias=False)
+        self.kv_proj = nn.Linear(cfg.d_model, 2 * cfg.n_kv_heads * self.d_head, bias=False)
+        self.out_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
         self.attn_drop = cfg.dropout
         self.resid_drop = nn.Dropout(cfg.dropout)
+        # Optional QK-norm. When `qk_norm=False` (default), these are no-ops and
+        # contribute no parameters to state_dict — old checkpoints stay compatible.
+        if getattr(cfg, "qk_norm", False):
+            self.q_norm: nn.Module = RMSNorm(self.d_head)
+            self.k_norm: nn.Module = RMSNorm(self.d_head)
+        else:
+            self.q_norm = nn.Identity()
+            self.k_norm = nn.Identity()
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        B, T, C = x.shape
-        qkv = self.qkv(x).reshape(B, T, 3, self.n_heads, self.d_head)
-        q, k, v = qkv.unbind(dim=2)  # each: (B, T, n_heads, d_head)
-        q = q.transpose(1, 2)  # (B, n_heads, T, d_head)
-        k = k.transpose(1, 2)
+        B, T, _ = x.shape
+        q = self.q_proj(x).reshape(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        kv = self.kv_proj(x).reshape(B, T, 2, self.n_kv_heads, self.d_head)
+        k, v = kv.unbind(dim=2)
+        k = k.transpose(1, 2)  # (B, n_kv_heads, T, d_head)
         v = v.transpose(1, 2)
+
+        # QK-norm (no-op when cfg.qk_norm is False — nn.Identity).
+        q = self.q_norm(q)
+        k = self.k_norm(k)
 
         q = apply_rotary(q, cos, sin)
         k = apply_rotary(k, cos, sin)
+
+        if self.n_rep > 1:
+            k = k.repeat_interleave(self.n_rep, dim=1)
+            v = v.repeat_interleave(self.n_rep, dim=1)
 
         out = F.scaled_dot_product_attention(
             q, k, v, is_causal=True,
             dropout_p=self.attn_drop if self.training else 0.0,
         )  # (B, n_heads, T, d_head)
-        out = out.transpose(1, 2).reshape(B, T, C)
+        out = out.transpose(1, 2).reshape(B, T, self.n_heads * self.d_head)
         return self.resid_drop(self.out_proj(out))
 
 
+class SwiGLU(nn.Module):
+    """SwiGLU FFN: down(SiLU(gate(x)) * up(x)). Three matrices, no bias (Llama-style)."""
+
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        self.gate = nn.Linear(cfg.d_model, cfg.d_ff, bias=False)
+        self.up = nn.Linear(cfg.d_model, cfg.d_ff, bias=False)
+        self.down = nn.Linear(cfg.d_ff, cfg.d_model, bias=False)
+        self.drop = nn.Dropout(cfg.dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.drop(self.down(F.silu(self.gate(x)) * self.up(x)))
+
+
 class PreNormBlock(nn.Module):
-    """Pre-LayerNorm Transformer decoder block."""
+    """Pre-LayerNorm Transformer decoder block (GQA + SwiGLU + RoPE)."""
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.ln1 = nn.LayerNorm(cfg.d_model)
         self.attn = CausalSelfAttention(cfg)
         self.ln2 = nn.LayerNorm(cfg.d_model)
-        self.ffn = nn.Sequential(
-            nn.Linear(cfg.d_model, cfg.d_ff),
-            nn.GELU(),
-            nn.Dropout(cfg.dropout),
-            nn.Linear(cfg.d_ff, cfg.d_model),
-            nn.Dropout(cfg.dropout),
-        )
+        self.ffn = SwiGLU(cfg)
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         x = x + self.attn(self.ln1(x), cos, sin)

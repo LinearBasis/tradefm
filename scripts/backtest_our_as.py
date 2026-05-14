@@ -58,7 +58,6 @@ def main():
     p.add_argument("--device", default="cpu")
     # A-S risk aversion (the only A-S param we still pick by hand; μ/σ/κ from heads)
     p.add_argument("--gamma", type=float, default=0.1)
-    p.add_argument("--tau", type=float, default=512.0)
     # Strategy mechanics
     p.add_argument("--quote-refresh-ms", type=float, default=1000.0)
     p.add_argument("--order-qty", type=float, default=1.0)
@@ -237,7 +236,7 @@ def main():
             sigma=torch.tensor(sigma_v),
             kappa=torch.tensor(kappa_v),
             inventory=torch.tensor(position),
-            gamma=args.gamma, tau=args.tau,
+            gamma=args.gamma,
         )
         bid_px, ask_px = out["bid"].item(), out["ask"].item()
 
@@ -315,7 +314,7 @@ def main():
             "context_length": model_cfg.context_length,
             "d_model": model_cfg.d_model,
         },
-        "as_params": {"gamma": args.gamma, "tau": args.tau,
+        "as_params": {"gamma": args.gamma,
                       "mu": "from heads", "sigma": "from heads", "kappa": "from heads"},
     }
     with open(out_dir / "summary.json", "w") as f:
