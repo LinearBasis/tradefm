@@ -5,6 +5,12 @@ import numpy as np
 
 from src.config import PipelineConfig
 
+try:
+    import numba
+    _HAS_NUMBA = True
+except ImportError:
+    _HAS_NUMBA = False
+
 
 def compute_ewvwap(df: pl.DataFrame, cfg: PipelineConfig) -> pl.DataFrame:
     """Compute EW-VWAP mid-price estimate per instrument per day from trade executions.
@@ -33,8 +39,14 @@ def compute_ewvwap(df: pl.DataFrame, cfg: PipelineConfig) -> pl.DataFrame:
         volume = sec_df["VOLUME"].to_numpy()
         nos = sec_df["NO"].to_numpy()
 
-        mid_prices = _ewvwap_numba(
-            time_sec, action, trade_price, volume, cfg.ewvwap_halflife_sec
+        # Cast volume to float64 once at call-site so the JIT specializes
+        # on a single numeric type and doesn't recompile across instruments.
+        mid_prices = _ewvwap_jit(
+            time_sec.astype(np.float64, copy=False),
+            action,
+            trade_price.astype(np.float64, copy=False),
+            volume.astype(np.float64, copy=False),
+            float(cfg.ewvwap_halflife_sec),
         )
 
         result_frames.append(
@@ -49,31 +61,34 @@ def compute_ewvwap(df: pl.DataFrame, cfg: PipelineConfig) -> pl.DataFrame:
     return df.join(mid_df, on=["NO", "date"], how="left")
 
 
-def _ewvwap_numba(
+def _ewvwap_core(
     time_sec: np.ndarray,
     action: np.ndarray,
     trade_price: np.ndarray,
     volume: np.ndarray,
     halflife: float,
 ) -> np.ndarray:
-    """Vectorized EW-VWAP computation.
+    """EW-VWAP per row, updated only on trade events (ACTION=2).
 
-    For each row, mid_price = EMA(price * volume) / EMA(volume),
-    updated only on trade events (ACTION=2).
+    mid_price[i] = EMA(price * volume) / EMA(volume) at row i.
+
+    This is a tight scalar loop over 1D numpy arrays — exactly the shape
+    that numba @njit compiles to native machine code (see `_ewvwap_jit` below).
+    Kept as a plain-Python function so the fallback (when numba is missing)
+    and the JIT-compiled version share one source of truth.
     """
     n = len(time_sec)
     mid = np.full(n, np.nan, dtype=np.float64)
 
-    ema_pv = 0.0  # EMA of price * volume
-    ema_v = 0.0  # EMA of volume
+    ema_pv = 0.0
+    ema_v = 0.0
     last_trade_time = -1.0
     initialized = False
 
     for i in range(n):
         if action[i] == 2 and not np.isnan(trade_price[i]):
             p = trade_price[i]
-            v = float(volume[i])
-
+            v = volume[i]
             if not initialized:
                 ema_pv = p * v
                 ema_v = v
@@ -83,13 +98,20 @@ def _ewvwap_numba(
                 alpha = 1.0 - 0.5 ** (dt / halflife)
                 ema_pv = alpha * p * v + (1.0 - alpha) * ema_pv
                 ema_v = alpha * v + (1.0 - alpha) * ema_v
-
             last_trade_time = time_sec[i]
-
         if initialized and ema_v > 0:
             mid[i] = ema_pv / ema_v
 
     return mid
+
+
+# JIT-compiled version. `cache=True` writes the compiled binary to
+# __pycache__/_ewvwap_core.<sig>.nbi/.nbc so subsequent ProcessPool workers
+# don't recompile. `nogil=True` releases the GIL during execution.
+if _HAS_NUMBA:
+    _ewvwap_jit = numba.njit(cache=True, nogil=True)(_ewvwap_core)
+else:
+    _ewvwap_jit = _ewvwap_core
 
 
 def compute_open_price(df: pl.DataFrame) -> pl.DataFrame:
