@@ -5,37 +5,54 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _build_mlp(d_in: int, d_hidden: int, dropout: float = 0.1) -> nn.Sequential:
+    """Two-layer MLP: d_in → d_hidden → 1, with GELU + dropout in the middle."""
+    return nn.Sequential(
+        nn.Linear(d_in, d_hidden),
+        nn.GELU(),
+        nn.Dropout(dropout),
+        nn.Linear(d_hidden, 1),
+    )
+
+
 class DecisionModule(nn.Module):
-    """Three linear probes over transformer hidden states.
+    """Three MLP heads over transformer hidden states.
+
+    Each head is a 2-layer MLP (d_model → d_model//2 → 1) with GELU activation.
+    Compared with the previous linear-probe version (~3·d_model params), this
+    gives each head ~d_model² / 2 params, enabling non-linear combinations of
+    latent features.
 
     Heads:
-        alpha  — expected forward return (signed, no activation)
-        risk   — realized volatility (positive, softplus)
+        alpha     — expected forward return (signed, no activation)
+        risk      — realized volatility (positive, softplus)
         intensity — normalized trade intensity (positive, softplus)
 
     Input:  (B, T, d_model) hidden states
     Output: dict of (B, T) predictions per head
     """
 
-    def __init__(self, d_model: int):
+    def __init__(self, d_model: int, hidden_mult: float = 0.5, dropout: float = 0.1):
         super().__init__()
-        self.alpha_head = nn.Linear(d_model, 1)
-        self.risk_head = nn.Linear(d_model, 1)
-        self.intensity_head = nn.Linear(d_model, 1)
+        d_hidden = max(int(d_model * hidden_mult), 16)
+        self.alpha_head = _build_mlp(d_model, d_hidden, dropout)
+        self.risk_head = _build_mlp(d_model, d_hidden, dropout)
+        self.intensity_head = _build_mlp(d_model, d_hidden, dropout)
         self._init_weights()
 
     def _init_weights(self):
-        for head in [self.alpha_head, self.risk_head, self.intensity_head]:
-            nn.init.normal_(head.weight, std=0.01)
-            nn.init.zeros_(head.bias)
-        # Bias risk and intensity heads toward reasonable positive values
-        # softplus(0.5) ≈ 1.0
-        self.risk_head.bias.data.fill_(0.5)
-        self.intensity_head.bias.data.fill_(0.5)
+        """GPT-2 style init for linears, plus positive bias on the final
+        layer of risk/intensity heads so softplus output starts near 1.0."""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_normal_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        # Final-layer bias on risk and intensity → softplus(0.5) ≈ 0.97
+        self.risk_head[-1].bias.data.fill_(0.5)
+        self.intensity_head[-1].bias.data.fill_(0.5)
 
-    def forward(
-        self, hidden: torch.Tensor
-    ) -> dict[str, torch.Tensor]:
+    def forward(self, hidden: torch.Tensor) -> dict[str, torch.Tensor]:
         """
         Args:
             hidden: (B, T, d_model) transformer hidden states
@@ -65,8 +82,11 @@ class DecisionModule(nn.Module):
             preds:   dict of (B, T) predictions
             targets: dict of (B, T) target values
             mask:    (B, T) bool — True where targets are valid
-            huber_delta: delta for Huber loss (alpha head)
-            w_alpha, w_risk, w_intensity: loss weights
+            huber_delta: delta for Huber loss (alpha head). Targets are scaled
+                         ~1e-4 (per-second relative return), so 1e-4 is sensible.
+            w_alpha, w_risk, w_intensity: loss weights. Note that raw scales
+                differ by orders of magnitude — α-Huber ~1e-7 vs σ/κ log-MSE ~10.
+                Use w_alpha >> 1 to balance gradients across heads.
 
         Returns:
             dict with per-head losses and "total"
@@ -75,7 +95,6 @@ class DecisionModule(nn.Module):
             zero = torch.tensor(0.0, device=mask.device, requires_grad=True)
             return {"alpha": zero, "risk": zero, "intensity": zero, "total": zero}
 
-        # Alpha: Huber loss
         loss_alpha = F.huber_loss(
             preds["alpha"][mask],
             targets["alpha"][mask],
@@ -83,14 +102,11 @@ class DecisionModule(nn.Module):
             reduction="mean",
         )
 
-        # Risk: MSE in log space
         eps = 1e-8
         loss_risk = F.mse_loss(
             torch.log(preds["risk"][mask] + eps),
             torch.log(targets["risk"][mask] + eps),
         )
-
-        # Intensity: MSE in log space
         loss_intensity = F.mse_loss(
             torch.log(preds["intensity"][mask] + eps),
             torch.log(targets["intensity"][mask] + eps),

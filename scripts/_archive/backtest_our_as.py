@@ -25,8 +25,8 @@ import numpy as np
 import polars as pl
 import torch
 
-from src.decision.avellaneda_stoikov import avellaneda_stoikov_quotes
-from src.decision.heads import DecisionModule
+from src._archive.decision.avellaneda_stoikov import avellaneda_stoikov_quotes
+from src._archive.decision.heads import DecisionModule
 from src.models.transformer import OrderFlowTransformer
 
 
@@ -229,11 +229,11 @@ def main():
         kappa_v = preds["intensity"][0, -1].item()
         n_forwards += 1
 
-        # A-S quotes
+        # A-S quotes. Head σ is dimensionless relative — convert to price units.
+        sigma_price = torch.tensor(sigma_v * mid)
         out = avellaneda_stoikov_quotes(
             mid=torch.tensor(mid),
-            mu=torch.tensor(mu_v),
-            sigma=torch.tensor(sigma_v),
+            sigma=sigma_price,
             kappa=torch.tensor(kappa_v),
             inventory=torch.tensor(position),
             gamma=args.gamma,

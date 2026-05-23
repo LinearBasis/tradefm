@@ -39,7 +39,7 @@ from tqdm import tqdm
 
 from src.config import HeadConfig, ModelConfig
 from src.data.dataset import OrderFlowDataset
-from src.decision.heads import DecisionModule
+from src._archive.decision.heads import DecisionModule
 from src.models.transformer import OrderFlowTransformer
 
 
@@ -440,6 +440,17 @@ def main():
                         help="Resume from a heads checkpoint (.pt)")
     parser.add_argument("--run-name", type=str, default=None,
                         help="TensorBoard run name (default: timestamp)")
+    # Smoke / experiment overrides for cfg fields
+    parser.add_argument("--max-epochs", type=int, default=None,
+                        help="Override cfg.max_epochs")
+    parser.add_argument("--batch-size", type=int, default=None,
+                        help="Override cfg.batch_size")
+    parser.add_argument("--sequences-dir", type=str, default=None,
+                        help="Override cfg.sequences_dir")
+    parser.add_argument("--checkpoint-dir", type=str, default=None,
+                        help="Override cfg.checkpoint_dir")
+    parser.add_argument("--transformer-checkpoint", type=str, default=None,
+                        help="Override cfg.transformer_checkpoint")
     args = parser.parse_args()
 
     rank, local_rank, world_size, device = _ddp_setup()
@@ -452,6 +463,13 @@ def main():
 
     from src.config import load_from_json
     cfg = load_from_json(HeadConfig, args.config)
+    # Apply CLI overrides
+    if args.max_epochs is not None: cfg.max_epochs = args.max_epochs
+    if args.batch_size is not None: cfg.batch_size = args.batch_size
+    if args.sequences_dir is not None: cfg.sequences_dir = args.sequences_dir
+    if args.checkpoint_dir is not None: cfg.checkpoint_dir = args.checkpoint_dir
+    if args.transformer_checkpoint is not None:
+        cfg.transformer_checkpoint = args.transformer_checkpoint
     model_cfg = ModelConfig()
     model_cfg.sequences_dir = cfg.sequences_dir
     if _is_main(rank):

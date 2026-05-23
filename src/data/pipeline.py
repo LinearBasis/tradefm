@@ -3,6 +3,9 @@
 Processes one day at a time. Days are independent after calibration, so the
 two heavy stages (calibration features, full per-day processing) parallelise
 across days via a ProcessPoolExecutor when `cfg.n_jobs > 1`.
+
+Tokenizer state (edges + ADV) is persisted to `data/processed/tokenizer.json`
+and can be reused across runs via `--reuse-tokenizer`.
 """
 
 import json
@@ -10,6 +13,7 @@ import multiprocessing as mp
 import os
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
 
 import polars as pl
 from tqdm import tqdm
@@ -22,13 +26,7 @@ from src.data.features import (
     compute_open_price,
 )
 from src.data.loader import discover_files, load_day, select_instruments
-from src.data.tokenizer import (
-    BinEdges,
-    calibrate_bins,
-    compose_trade_token,
-    digitize_features,
-)
-from src.decision.targets import add_targets_to_orders
+from src.data.tokenizer import Tokenizer
 
 
 # --------------------------------------------------------------------------- #
@@ -48,11 +46,10 @@ def _worker_init(polars_threads: int) -> None:
 # Per-day functions (top-level so they pickle cleanly into worker processes)  #
 # --------------------------------------------------------------------------- #
 
-def _calibrate_day(
+def _featurise_day(
     path: str, date: str, instruments: list[str], cfg: PipelineConfig
 ) -> pl.DataFrame:
-    """Load + featurise one calibration day. Returns the order-level frame
-    used by `calibrate_bins` (concatenated across days in the parent)."""
+    """Load + EW-VWAP + open + ADV-source + order features. Returns the order frame."""
     df = load_day(path, date, instruments, cfg)
     df = compute_ewvwap(df, cfg)
     df = compute_open_price(df)
@@ -60,11 +57,30 @@ def _calibrate_day(
     return build_order_features(df, cfg)
 
 
+def _calibration_payload(
+    path: str, date: str, instruments: list[str], cfg: PipelineConfig
+) -> tuple[pl.DataFrame, dict[str, float]]:
+    """Per-day calibration payload: feature columns + per-instrument daily volume."""
+    orders = _featurise_day(path, date, instruments, cfg)
+    features = orders.select([
+        "interarrival", "log_volume", "price_depth", "price_level",
+    ])
+    daily_vols = {
+        row["SECCODE"]: float(row["dv"])
+        for row in (
+            orders.group_by("SECCODE")
+            .agg(pl.col("daily_volume").first().alias("dv"))
+            .iter_rows(named=True)
+        )
+    }
+    return features, daily_vols
+
+
 def _process_day(
     path: str,
     date: str,
     instruments: list[str],
-    edges: BinEdges,
+    tokenizer: Tokenizer,
     cfg: PipelineConfig,
     train_set: set[str],
     val_set: set[str],
@@ -75,19 +91,10 @@ def _process_day(
     """
     df = load_day(path, date, instruments, cfg)
     n_rows = df.height
+    orders = _featurise_day_from_loaded(df, cfg)
+    orders = tokenizer.transform(orders)
 
-    df = compute_ewvwap(df, cfg)
-    df = compute_open_price(df)
-    df = compute_daily_volume(df)
-    orders = build_order_features(df, cfg)
-
-    orders = digitize_features(orders, edges, cfg)
-    orders = compose_trade_token(orders, cfg)
-
-    token_cols = ["trade_token", "bin_price_level", "bin_liquidity"]
-    target_cols = ["target_alpha", "target_risk", "target_intensity"]
-    session_len = cfg.continuous_end_sec - cfg.continuous_start_sec
-
+    token_cols = ["trade_token", "bin_price_level", "bin_liquidity", "time_sec", "SECCODE"]
     entries: dict[str, dict] = {}
     n_day_tokens = 0
 
@@ -96,26 +103,27 @@ def _process_day(
         if sec_orders.height == 0:
             continue
 
-        sec_full = df.filter(pl.col("SECCODE") == seccode).sort("NO")
-        seq = add_targets_to_orders(
-            sec_orders, sec_full, tau_sec=cfg.tau_sec, session_length=session_len,
-        )
-
         key = f"{seccode}_{date}"
-        seq.select(token_cols + target_cols).write_parquet(
+        sec_orders.select(token_cols).write_parquet(
             os.path.join(seq_dir, f"{key}.parquet")
         )
 
         split = "train" if date in train_set else ("val" if date in val_set else "unknown")
-        n_valid = seq.filter(pl.col("target_alpha").is_not_null()).height
         entries[key] = {
             "split": split,
-            "n_tokens": seq.height,
-            "n_valid_targets": n_valid,
+            "n_tokens": sec_orders.height,
         }
-        n_day_tokens += seq.height
+        n_day_tokens += sec_orders.height
 
     return date, entries, n_day_tokens, n_rows
+
+
+def _featurise_day_from_loaded(df: pl.DataFrame, cfg: PipelineConfig) -> pl.DataFrame:
+    """Same as _featurise_day but skips the load step (df already in memory)."""
+    df = compute_ewvwap(df, cfg)
+    df = compute_open_price(df)
+    df = compute_daily_volume(df)
+    return build_order_features(df, cfg)
 
 
 # --------------------------------------------------------------------------- #
@@ -153,8 +161,11 @@ def _run_parallel(fn, tasks, n_jobs, polars_threads, desc):
 # Entry point                                                                  #
 # --------------------------------------------------------------------------- #
 
-def run_pipeline(cfg: PipelineConfig | None = None) -> BinEdges:
-    """Execute full pipeline. Returns calibrated bin edges."""
+def run_pipeline(
+    cfg: PipelineConfig | None = None,
+    reuse_tokenizer: bool = False,
+) -> Tokenizer:
+    """Execute full pipeline. Returns the fitted (or loaded) Tokenizer."""
     if cfg is None:
         cfg = PipelineConfig()
 
@@ -184,26 +195,42 @@ def run_pipeline(cfg: PipelineConfig | None = None) -> BinEdges:
 
     train_set, val_set = set(train_dates), set(val_dates)
 
-    # 3. Calibrate bins (training days only, parallel) ----------------------
-    print("--- Calibrating tokenizer ---")
-    cal_days = cfg.calibration_days
-    cal_dates = train_dates[:cal_days] if cal_days is not None else train_dates
-    cal_files = [(p, d) for p, d in files if d in set(cal_dates)]
+    seq_dir = os.path.join(cfg.output_dir, "sequences")
+    os.makedirs(seq_dir, exist_ok=True)
+    tokenizer_path = Path(cfg.output_dir) / "tokenizer.json"
 
-    cal_tasks = [(p, d, instruments, cfg) for p, d in cal_files]
-    cal_orders = _run_parallel(
-        _calibrate_day, cal_tasks, n_jobs, pthreads, desc="Calibrate",
-    )
-    edges = calibrate_bins(pl.concat(cal_orders), cfg)
-    del cal_orders  # free memory before processing stage
+    # 3. Tokenizer: load or fit --------------------------------------------
+    if reuse_tokenizer and tokenizer_path.exists():
+        print(f"--- Loading tokenizer from {tokenizer_path} ---")
+        tokenizer = Tokenizer.load(tokenizer_path, cfg=cfg)
+    else:
+        print("--- Calibrating tokenizer ---")
+        cal_days = cfg.calibration_days
+        cal_dates = train_dates[:cal_days] if cal_days is not None else train_dates
+        cal_files = [(p, d) for p, d in files if d in set(cal_dates)]
+
+        cal_tasks = [(p, d, instruments, cfg) for p, d in cal_files]
+        cal_results = _run_parallel(
+            _calibration_payload, cal_tasks, n_jobs, pthreads, desc="Calibrate",
+        )
+
+        feature_frames = [r[0] for r in cal_results]
+        adv_per_day: dict[str, list[float]] = {}
+        for _, day_adv in cal_results:
+            for sec, dv in day_adv.items():
+                adv_per_day.setdefault(sec, []).append(dv)
+
+        tokenizer = Tokenizer.fit_from_features(
+            pl.concat(feature_frames), adv_per_day, cfg,
+        )
+        tokenizer.save(tokenizer_path)
+        print(f"  Saved tokenizer to {tokenizer_path}")
+        del cal_results, feature_frames
 
     # 4. Per-day processing (parallel) --------------------------------------
     print("--- Processing days ---")
-    seq_dir = os.path.join(cfg.output_dir, "sequences")
-    os.makedirs(seq_dir, exist_ok=True)
-
     proc_tasks = [
-        (p, d, instruments, edges, cfg, train_set, val_set, seq_dir)
+        (p, d, instruments, tokenizer, cfg, train_set, val_set, seq_dir)
         for p, d in files
     ]
     results = _run_parallel(
@@ -215,7 +242,6 @@ def run_pipeline(cfg: PipelineConfig | None = None) -> BinEdges:
         "train_dates": train_dates,
         "val_dates": val_dates,
         "instruments": sorted(instruments),
-        "tau_sec": cfg.tau_sec,
         "session_length_sec": cfg.continuous_end_sec - cfg.continuous_start_sec,
         "sequences": {},
     }
@@ -235,7 +261,7 @@ def run_pipeline(cfg: PipelineConfig | None = None) -> BinEdges:
     print(f"Vocab: {cfg.vocab_size:,} | Instruments: {len(instruments)} | Days: {n_dates}")
     print(f"Sequences: {len(manifest['sequences'])}  → {seq_dir}/manifest.json")
 
-    return edges
+    return tokenizer
 
 
 if __name__ == "__main__":
@@ -247,8 +273,10 @@ if __name__ == "__main__":
                         help="POLARS_MAX_THREADS in each worker")
     parser.add_argument("--raw-dir", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default=None)
-    parser.add_argument("--tau-sec", type=float, default=None,
-                        help="Forward target horizon in seconds (default: PipelineConfig.tau_sec)")
+    parser.add_argument("--top-n-instruments", type=int, default=None,
+                        help="Keep only top-N most active instruments (smoke: 2)")
+    parser.add_argument("--reuse-tokenizer", action="store_true",
+                        help="Skip calibration if data/processed/tokenizer.json exists")
     args = parser.parse_args()
 
     cfg = PipelineConfig()
@@ -260,7 +288,7 @@ if __name__ == "__main__":
         cfg.raw_dir = args.raw_dir
     if args.output_dir is not None:
         cfg.output_dir = args.output_dir
-    if args.tau_sec is not None:
-        cfg.tau_sec = args.tau_sec
+    if args.top_n_instruments is not None:
+        cfg.top_n_instruments = args.top_n_instruments
 
-    run_pipeline(cfg)
+    run_pipeline(cfg, reuse_tokenizer=args.reuse_tokenizer)

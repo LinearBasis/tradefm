@@ -44,6 +44,9 @@ class ModelConfig:
     n_price_level_bins: int = 32
     n_liquidity_bins: int = 3
     n_instruments: int = 20
+    # Paper-faithful default: no asset-specific embedding (scale-invariant features
+    # are the whole point of TradeFM). Enable for ablation on small-N datasets.
+    use_instrument_emb: bool = False
 
     # --- Training ---
     batch_size: int = 64
@@ -70,38 +73,14 @@ class ModelConfig:
     checkpoint_dir: str = "checkpoints"
     patience: int = 5  # early stopping patience (epochs)
 
-
-@dataclass
-class HeadConfig:
-    # --- Targets ---
-    # Forward horizon in seconds. Reasonable values: 0.5 / 1.0 / 5.0 / 30.0.
-    # Must match PipelineConfig.tau_sec used when generating the parquets,
-    # otherwise the heads will be trained on the wrong horizon.
-    tau_sec: float = 1.0
-    session_length_sec: float = 30840.0  # 18:39 - 10:05
-
-    # --- Architecture ---
-    d_model: int = 128  # must match ModelConfig.d_model
-    latent_layer: int = -1  # which transformer layer to extract from
-
-    # --- Training ---
-    batch_size: int = 256
-    lr: float = 1e-3
-    weight_decay: float = 0.01
-    max_epochs: int = 50
-    patience: int = 10
-    warmup_fraction: float = 0.05
-
-    # --- Loss weights ---
-    w_alpha: float = 1.0
-    w_risk: float = 1.0
-    w_intensity: float = 1.0
-    huber_delta: float = 1e-4  # scale of returns is ~1e-4
-
-    # --- Paths ---
-    sequences_dir: str = "data/processed/sequences"
-    transformer_checkpoint: str = "checkpoints/best.pt"
-    checkpoint_dir: str = "checkpoints/heads"
+    # --- Stylized-fact rollout (paper §9.1-9.2) ---
+    # 0 = disabled; otherwise run a reduced closed-loop rollout every N epochs +
+    # at the end of training, logging stylized-fact metrics to TensorBoard.
+    rollout_every_n_epochs: int = 0
+    rollout_n_events: int = 512
+    rollout_n_rollouts: int = 3
+    rollout_init_mid: float = 100.0
+    tokenizer_path: str = "data/processed/tokenizer.json"
 
 
 @dataclass
@@ -121,11 +100,6 @@ class PipelineConfig:
 
     # --- EW-VWAP ---
     ewvwap_halflife_sec: float = 10.0
-
-    # --- Target horizon ---
-    # Forward horizon in seconds for decision-head targets baked into parquets.
-    # Reasonable values: 0.5 / 1.0 / 5.0 / 30.0. Must match HeadConfig.tau_sec.
-    tau_sec: float = 1.0
 
     # --- Binning ---
     n_bins_price_depth: int = 16

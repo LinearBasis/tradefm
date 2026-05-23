@@ -138,11 +138,19 @@ class OrderFlowTransformer(nn.Module):
         # Token embedding
         self.token_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
 
-        # Context embeddings (additive fusion)
+        # Context embeddings (additive fusion).
+        # `use_instrument_emb`: paper-faithful default is False (TradeFM relies on
+        # scale-invariant features rather than asset-specific embeddings). Enable
+        # for ablation on small-N datasets.
+        self.use_instrument_emb = getattr(cfg, "use_instrument_emb", False)
         self.price_level_emb = nn.Embedding(cfg.n_price_level_bins, cfg.d_context)
         self.liquidity_emb = nn.Embedding(cfg.n_liquidity_bins, cfg.d_context)
-        self.instrument_emb = nn.Embedding(cfg.n_instruments, cfg.d_context)
-        self.context_proj = nn.Linear(3 * cfg.d_context, cfg.d_model)
+        if self.use_instrument_emb:
+            self.instrument_emb = nn.Embedding(cfg.n_instruments, cfg.d_context)
+            ctx_in_dim = 3 * cfg.d_context
+        else:
+            ctx_in_dim = 2 * cfg.d_context
+        self.context_proj = nn.Linear(ctx_in_dim, cfg.d_model)
 
         # Rotary positional embedding: precompute inverse frequencies (no parameters).
         # cos/sin are derived per-forward from current sequence length, so the model
@@ -184,6 +192,20 @@ class OrderFlowTransformer(nn.Module):
                 nn.init.ones_(module.weight)
                 nn.init.zeros_(module.bias)
 
+    def _context(
+        self,
+        T: int,
+        price_levels: torch.Tensor,
+        liquidities: torch.Tensor,
+        instrument_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        ctx_parts = [self.price_level_emb(price_levels), self.liquidity_emb(liquidities)]
+        if self.use_instrument_emb:
+            ctx_parts.append(
+                self.instrument_emb(instrument_ids.unsqueeze(1).expand(-1, T))
+            )
+        return self.context_proj(torch.cat(ctx_parts, dim=-1))
+
     def forward(
         self,
         trade_tokens: torch.Tensor,    # (B, T)
@@ -194,15 +216,8 @@ class OrderFlowTransformer(nn.Module):
         """Forward pass. Returns logits (B, T, vocab_size)."""
         _, T = trade_tokens.shape
 
-        # Embeddings
-        tok = self.token_emb(trade_tokens)  # (B, T, d_model)
-
-        ctx = torch.cat([
-            self.price_level_emb(price_levels),
-            self.liquidity_emb(liquidities),
-            self.instrument_emb(instrument_ids.unsqueeze(1).expand(-1, T)),
-        ], dim=-1)  # (B, T, 3*d_context)
-        ctx = self.context_proj(ctx)  # (B, T, d_model)
+        tok = self.token_emb(trade_tokens)
+        ctx = self._context(T, price_levels, liquidities, instrument_ids)
 
         x = self.drop(tok + ctx)
 
@@ -232,12 +247,7 @@ class OrderFlowTransformer(nn.Module):
         _, T = trade_tokens.shape
 
         tok = self.token_emb(trade_tokens)
-        ctx = torch.cat([
-            self.price_level_emb(price_levels),
-            self.liquidity_emb(liquidities),
-            self.instrument_emb(instrument_ids.unsqueeze(1).expand(-1, T)),
-        ], dim=-1)
-        ctx = self.context_proj(ctx)
+        ctx = self._context(T, price_levels, liquidities, instrument_ids)
 
         x = self.drop(tok + ctx)
 
@@ -270,12 +280,7 @@ class OrderFlowTransformer(nn.Module):
         _, T = trade_tokens.shape
 
         tok = self.token_emb(trade_tokens)
-        ctx = torch.cat([
-            self.price_level_emb(price_levels),
-            self.liquidity_emb(liquidities),
-            self.instrument_emb(instrument_ids.unsqueeze(1).expand(-1, T)),
-        ], dim=-1)
-        ctx = self.context_proj(ctx)
+        ctx = self._context(T, price_levels, liquidities, instrument_ids)
 
         x = self.drop(tok + ctx)
 

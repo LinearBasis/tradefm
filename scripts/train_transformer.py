@@ -43,6 +43,8 @@ from tqdm import tqdm
 
 from src.config import ModelConfig
 from src.data.dataset import OrderFlowDataset
+from src.data.tokenizer import Tokenizer, subtoken_factors
+from src.eval.stylized_facts import compute_stylized_facts, run_rollout
 from src.training.muon import HybridMuonAdamW
 from src.models.transformer import OrderFlowTransformer
 
@@ -242,6 +244,77 @@ def train_epoch(
     return _all_reduce_mean(local_avg, world_size, device), step
 
 
+def _run_stylized_fact_rollout(
+    model: nn.Module, val_ds: OrderFlowDataset, cfg: ModelConfig,
+    device: torch.device, writer: SummaryWriter | None, epoch: int,
+) -> None:
+    """Closed-loop rollout + stylized facts. Skips silently if tokenizer is missing."""
+    import json
+    from pathlib import Path
+    import numpy as np
+
+    tok_path = Path(cfg.tokenizer_path)
+    if not tok_path.exists():
+        print(f"  [rollout] skipping — tokenizer not found at {tok_path}")
+        return
+
+    tokenizer = Tokenizer.load(tok_path)
+    # Seed window from the first val window (any instrument).
+    if len(val_ds) == 0:
+        print("  [rollout] skipping — val dataset empty")
+        return
+    seed = val_ds[0]
+    seed_tokens = seed["trade_tokens"].tolist()
+    seed_plevels = seed["price_levels"].tolist()
+    seed_liq = int(seed["liquidities"][0])
+    inst_id = int(seed["instrument_id"])
+
+    underlying = model.module if hasattr(model, "module") else model
+    all_returns = []
+    for i in range(cfg.rollout_n_rollouts):
+        torch.manual_seed(epoch * 1000 + i)
+        gen = run_rollout(
+            model=underlying, tokenizer=tokenizer,
+            seed_tokens=seed_tokens, seed_plevels=seed_plevels,
+            seed_liquidity=seed_liq, instrument_id=inst_id,
+            init_mid=cfg.rollout_init_mid, n_events=cfg.rollout_n_events,
+            device=device,
+        )
+        r = np.diff(gen["mid"]) / gen["mid"][:-1]
+        all_returns.append(r)
+    returns = np.concatenate(all_returns)
+    sf = compute_stylized_facts(returns)
+
+    if writer is not None:
+        writer.add_scalar("rollout/kurtosis", sf["kurtosis"], epoch)
+        writer.add_scalar("rollout/kurtosis_agg_5", sf["kurtosis_agg_5"], epoch)
+        writer.add_scalar("rollout/acf_returns_lag1", float(sf["acf_returns"][1]), epoch)
+        writer.add_scalar("rollout/acf_abs_returns_lag1", float(sf["acf_abs_returns"][1]), epoch)
+    print(f"  [rollout] kurtosis={sf['kurtosis']:.2f}, "
+          f"acf_r[1]={sf['acf_returns'][1]:+.3f}, acf_|r|[1]={sf['acf_abs_returns'][1]:+.3f}")
+
+
+def _decompose_token(tok: torch.Tensor, factors: tuple[int, int, int, int, int]):
+    """Vectorized inverse of the mixed-base composite token (see tokenizer.py).
+
+    Returns a tuple (i_action, i_side, i_depth, i_volume, i_interarrival).
+    """
+    _n_a, n_s, n_d, n_v, n_t = factors
+    block_action = n_s * n_d * n_v * n_t
+    block_side = n_d * n_v * n_t
+    block_depth = n_v * n_t
+
+    i_action = torch.div(tok, block_action, rounding_mode="floor")
+    rem = tok % block_action
+    i_side = torch.div(rem, block_side, rounding_mode="floor")
+    rem = rem % block_side
+    i_depth = torch.div(rem, block_depth, rounding_mode="floor")
+    rem = rem % block_depth
+    i_vol = torch.div(rem, n_t, rounding_mode="floor")
+    i_iat = rem % n_t
+    return i_action, i_side, i_depth, i_vol, i_iat
+
+
 @torch.no_grad()
 def evaluate(
     model: nn.Module,
@@ -253,10 +326,21 @@ def evaluate(
     amp_dtype: torch.dtype | None,
     rank: int,
     world_size: int,
-) -> float:
+) -> tuple[float, dict[str, float]]:
+    """Run validation. Returns (loss, per_subtoken_accuracy_dict).
+
+    Per-subtoken accuracy is computed by decomposing argmax token and target
+    token into (action, side, depth, vol, interarrival) and comparing each
+    component. Logged to TensorBoard only — not surfaced in tqdm.
+    """
     model.eval()
     total_loss = 0.0
     n_batches = 0
+
+    factors = subtoken_factors(cfg.vocab_size)
+    component_names = ("action", "side", "depth", "vol", "iat")
+    correct_sum = {name: 0.0 for name in component_names}
+    n_positions = 0
 
     use_amp = amp_dtype is not None and device.type == "cuda"
 
@@ -294,12 +378,28 @@ def evaluate(
         total_loss += loss.item()
         n_batches += 1
 
+        # Per-subtoken accuracy (decompose argmax pred + target).
+        pred_tok = logits.argmax(dim=-1)
+        pred_comps = _decompose_token(pred_tok, factors)
+        true_comps = _decompose_token(target_tokens, factors)
+        for name, p_c, t_c in zip(component_names, pred_comps, true_comps):
+            correct_sum[name] += (p_c == t_c).float().sum().item()
+        n_positions += target_tokens.numel()
+
         if _is_main(rank) and hasattr(iterable, "set_postfix"):
             avg = total_loss / n_batches
             iterable.set_postfix(loss=f"{avg:.4f}", ppl=f"{math.exp(min(avg, 20)):.0f}")
 
     local_avg = total_loss / max(n_batches, 1)
-    return _all_reduce_mean(local_avg, world_size, device)
+    avg_loss = _all_reduce_mean(local_avg, world_size, device)
+
+    # All-reduce per-component accuracies (sum-of-correct + sum-of-positions).
+    acc: dict[str, float] = {}
+    for name in component_names:
+        local_acc = correct_sum[name] / max(n_positions, 1)
+        acc[name] = _all_reduce_mean(local_acc, world_size, device)
+
+    return avg_loss, acc
 
 
 # --------------------------------------------------------------------------- #
@@ -325,6 +425,15 @@ def main():
                         help="Resume from a checkpoint (.pt)")
     parser.add_argument("--run-name", type=str, default=None,
                         help="TensorBoard run name (default: timestamp)")
+    # Smoke / experiment overrides for cfg fields (so you can reuse base.json on small data)
+    parser.add_argument("--max-epochs", type=int, default=None,
+                        help="Override cfg.max_epochs")
+    parser.add_argument("--batch-size", type=int, default=None,
+                        help="Override cfg.batch_size")
+    parser.add_argument("--sequences-dir", type=str, default=None,
+                        help="Override cfg.sequences_dir (e.g. data/processed_smoke/sequences)")
+    parser.add_argument("--checkpoint-dir", type=str, default=None,
+                        help="Override cfg.checkpoint_dir (e.g. checkpoints_smoke/transformer)")
     args = parser.parse_args()
 
     # --- DDP / device -------------------------------------------------------
@@ -341,6 +450,11 @@ def main():
 
     from src.config import load_from_json
     cfg = load_from_json(ModelConfig, args.config)
+    # Apply CLI overrides (mirror Smirnov-style "small data" smoke runs on real configs)
+    if args.max_epochs is not None: cfg.max_epochs = args.max_epochs
+    if args.batch_size is not None: cfg.batch_size = args.batch_size
+    if args.sequences_dir is not None: cfg.sequences_dir = args.sequences_dir
+    if args.checkpoint_dir is not None: cfg.checkpoint_dir = args.checkpoint_dir
     if _is_main(rank):
         print(f"Loaded config: {args.config}")
 
@@ -487,7 +601,7 @@ def main():
             amp_dtype, scaler, rank, world_size, writer,
             max_steps=args.max_steps,
         )
-        val_loss = evaluate(
+        val_loss, val_acc = evaluate(
             model, val_loader, cfg, device, epoch, cfg.max_epochs,
             amp_dtype, rank, world_size,
         )
@@ -507,6 +621,18 @@ def main():
                 writer.add_scalars("loss/epoch", {"train": train_loss, "val": val_loss}, epoch)
                 writer.add_scalars("perplexity/epoch", {"train": train_ppl, "val": val_ppl}, epoch)
                 writer.add_scalar("lr/epoch", get_lr(step, warmup_steps, total_steps, cfg.lr), epoch)
+                # Per-subtoken validation accuracy: shows which feature components
+                # the model actually learns vs guesses. Not surfaced in tqdm.
+                for name, value in val_acc.items():
+                    writer.add_scalar(f"eval/acc_{name}", value, epoch)
+
+            # Stylized-fact rollout: opt-in via cfg.rollout_every_n_epochs.
+            # Runs on rank 0 only (closed-loop is sequential, not DDP-friendly).
+            if (
+                cfg.rollout_every_n_epochs > 0
+                and (epoch % cfg.rollout_every_n_epochs == 0 or epoch == cfg.max_epochs)
+            ):
+                _run_stylized_fact_rollout(model, val_ds, cfg, device, writer, epoch)
 
             # Always save "last", and "best" when improved
             sd = (model.module if use_ddp else model).state_dict()

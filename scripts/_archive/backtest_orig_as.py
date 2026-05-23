@@ -19,7 +19,7 @@ import hftbacktest as hb
 import numpy as np
 import polars as pl
 
-from src.decision.avellaneda_stoikov import avellaneda_stoikov_quotes
+from src._archive.decision.avellaneda_stoikov import avellaneda_stoikov_quotes
 import torch
 
 
@@ -130,7 +130,6 @@ def main():
     ASK_OID_BASE = 2 * 10**8
     EOD_OID_BASE = 9 * 10**8
 
-    mu = torch.tensor(args.mu)
     sigma = torch.tensor(args.sigma)
     kappa = torch.tensor(args.kappa)
 
@@ -199,7 +198,7 @@ def main():
         # A-S quotes
         q = torch.tensor(position)
         out = avellaneda_stoikov_quotes(
-            mid=torch.tensor(mid), mu=mu, sigma=sigma, kappa=kappa,
+            mid=torch.tensor(mid), sigma=sigma, kappa=kappa,
             inventory=q, gamma=args.gamma,
         )
         bid_px = out["bid"].item()

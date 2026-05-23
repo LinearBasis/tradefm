@@ -1,0 +1,30 @@
+{
+  "d_model": 384,
+  "n_heads": 6,
+  "n_kv_heads": 2,
+  "n_layers": 8,
+  "d_ff": 1536,
+  "d_context": 32,
+  "context_length": 1024,
+  "dropout": 0.1,
+  "qk_norm": true,
+  "use_instrument_emb": false,
+
+  "batch_size": 96,
+  "lr": 4e-4,
+  "weight_decay": 0.01,
+  "max_epochs": 20,
+  "warmup_fraction": 0.05,
+  "grad_clip_norm": 1.0,
+  "patience": 7,
+
+  "optimizer": "muon_hybrid",
+  "muon_lr": 0.02,
+  "muon_momentum": 0.95,
+  "muon_weight_decay": 0.01,
+  "muon_update_rescale": 0.2,
+
+  "stride": 256,
+  "sequences_dir": "data/processed/sequences",
+  "checkpoint_dir": "checkpoints/transformer_25m"
+}

@@ -17,8 +17,8 @@ from torch.utils.data import DataLoader
 
 from src.config import HeadConfig, ModelConfig, load_from_json
 from src.data.dataset import OrderFlowDataset
-from src.decision.avellaneda_stoikov import avellaneda_stoikov_quotes
-from src.decision.heads import DecisionModule
+from src._archive.decision.avellaneda_stoikov import avellaneda_stoikov_quotes
+from src._archive.decision.heads import DecisionModule
 from src.models.transformer import OrderFlowTransformer
 
 TRANSFORMER_CKPT = Path("/tmp/tradefm_smoke/transformer/best.pt")
@@ -96,8 +96,10 @@ def main():
     print(f"{'q':>6}  {'reservation':>12}  {'half_spread':>12}  {'bid':>10}  {'ask':>10}  {'skew':>10}")
     for q_val in INVENTORY_LEVELS:
         q = torch.full_like(mu_t, q_val)
+        # σ in price units: head outputs relative, multiply by mid.
+        sigma_price = sigma_t * mid
         out = avellaneda_stoikov_quotes(
-            mid=mid, mu=mu_t, sigma=sigma_t, kappa=kappa_t,
+            mid=mid, sigma=sigma_price, kappa=kappa_t,
             inventory=q, gamma=GAMMA,
         )
         # Take batch-mean for printout

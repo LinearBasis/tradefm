@@ -69,7 +69,7 @@ from optuna.samplers import TPESampler
 
 from src.config import HeadConfig, ModelConfig
 from src.data.dataset import OrderFlowDataset
-from src.decision.heads import DecisionModule
+from src._archive.decision.heads import DecisionModule
 from src.models.transformer import OrderFlowTransformer
 
 
