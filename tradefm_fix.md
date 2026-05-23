@@ -39,8 +39,8 @@
 - Старые чекпоинты совместимы через `strict=False` при resume.
 
 ### 6. Новые Muon-конфиги
-- `configs/base_75m.json`: d_model=512, n_layers=16, n_heads=8, n_kv_heads=2, qk_norm=true, `use_instrument_emb=false`, optimizer=muon_hybrid. Реальный размер: **~69M параметров**.
-- `configs/base_25m.json`: d_model=384, n_layers=8, n_heads=6, n_kv_heads=2, qk_norm=true. Реальный размер: **~23.6M параметров**.
+- `configs/base_50m.json`: d_model=512, n_layers=16, n_heads=8, n_kv_heads=2, d_ff=1344 (8/3·d_model, Llama ratio), qk_norm=true, `use_instrument_emb=false`, optimizer=muon_hybrid. Реальный размер: **~52M параметров**.
+- `configs/base_20m.json`: d_model=384, n_layers=8, n_heads=6, n_kv_heads=2, d_ff=1024 (8/3·d_model), qk_norm=true. Реальный размер: **~19M параметров**.
 
 ### 7. Per-subtoken accuracy в TensorBoard
 - В `evaluate()` argmax-токены декодируются на `(action, side, depth, vol, iat)` и сравниваются с таргетом.

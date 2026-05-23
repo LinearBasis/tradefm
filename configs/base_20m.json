@@ -3,7 +3,7 @@
   "n_heads": 6,
   "n_kv_heads": 2,
   "n_layers": 8,
-  "d_ff": 1536,
+  "d_ff": 1024,
   "d_context": 32,
   "context_length": 1024,
   "dropout": 0.1,
@@ -26,5 +26,5 @@
 
   "stride": 256,
   "sequences_dir": "data/processed/sequences",
-  "checkpoint_dir": "checkpoints/transformer_25m"
+  "checkpoint_dir": "checkpoints/transformer_20m"
 }
