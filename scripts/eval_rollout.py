@@ -99,6 +99,20 @@ def main():
     tokenizer = Tokenizer.load(Path(args.tokenizer))
     manifest = json.load(open(seq_dir / "manifest.json"))
     instruments = manifest["instruments"]
+    # Reproducibility check: model, tokenizer, and val data must agree on the
+    # instrument set. Silent mismatch → wrong instrument_id → garbage rollouts.
+    if sorted(tokenizer.instruments) != sorted(instruments):
+        raise RuntimeError(
+            f"Instrument mismatch: tokenizer.instruments ({len(tokenizer.instruments)}) "
+            f"!= manifest.instruments ({len(instruments)}). Tokenizer-only: "
+            f"{sorted(set(tokenizer.instruments) - set(instruments))[:5]}, "
+            f"manifest-only: {sorted(set(instruments) - set(tokenizer.instruments))[:5]}"
+        )
+    if cfg.n_instruments != len(instruments):
+        raise RuntimeError(
+            f"Model trained on {cfg.n_instruments} instruments, val data has "
+            f"{len(instruments)}. Probably wrong checkpoint or wrong --val-sequences."
+        )
     instrument = args.instrument or instruments[0]
     inst_id = instruments.index(instrument)
 

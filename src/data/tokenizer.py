@@ -54,6 +54,15 @@ class Tokenizer:
         self.adv = adv
         self.cfg = cfg
 
+    @property
+    def instruments(self) -> list[str]:
+        """Instruments this tokenizer was calibrated on, sorted alphabetically
+        (matches OrderFlowDataset.instrument_map convention).
+
+        Derived from ADV keys, which is the source of truth.
+        """
+        return sorted(self.adv.keys())
+
     # ----------------------------------------------------------------- fit ---
 
     @classmethod
@@ -211,6 +220,9 @@ class Tokenizer:
             "edges": {k: getattr(self.edges, k).tolist() for k in
                       ("interarrival", "price_depth", "volume", "price_level", "liquidity")},
             "adv": self.adv,
+            # Explicit instruments list (also derivable from adv.keys); written
+            # for human-readability and forward-compat.
+            "instruments": self.instruments,
             "cfg_snapshot": {
                 "n_bins_interarrival": self.cfg.n_bins_interarrival,
                 "n_bins_price_depth": self.cfg.n_bins_price_depth,

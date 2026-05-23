@@ -496,7 +496,21 @@ def main():
     )
 
     # --- Model --------------------------------------------------------------
-    cfg.n_instruments = len(train_ds.instrument_names)
+    # If resuming, the checkpoint's cfg dictates the architecture (instrument
+    # embedding vocab size). Refuse silent retraining on data with a different
+    # instrument count: that would either crash or, worse, silently misindex.
+    data_n_instruments = len(train_ds.instrument_names)
+    if args.resume:
+        ck_preview = torch.load(args.resume, map_location="cpu", weights_only=False)
+        ck_n_inst = int(ck_preview["config"].n_instruments)
+        if ck_n_inst != data_n_instruments:
+            raise RuntimeError(
+                f"Resume mismatch: checkpoint trained on {ck_n_inst} instruments, "
+                f"current dataset has {data_n_instruments}. Re-tokenise with the "
+                f"checkpoint's instrument set (--reuse-tokenizer) or train from scratch."
+            )
+        del ck_preview
+    cfg.n_instruments = data_n_instruments
     model = OrderFlowTransformer(cfg).to(device)
     if _is_main(rank):
         print(f"Parameters: {model.count_parameters():,} total, "

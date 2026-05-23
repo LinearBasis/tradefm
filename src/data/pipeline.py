@@ -25,7 +25,7 @@ from src.data.features import (
     compute_ewvwap,
     compute_open_price,
 )
-from src.data.loader import discover_files, load_day, select_instruments
+from src.data.loader import _base_scan, discover_files, load_day, select_instruments
 from src.data.tokenizer import Tokenizer
 
 
@@ -118,6 +118,69 @@ def _process_day(
     return date, entries, n_day_tokens, n_rows
 
 
+def _fit_tokenizer(
+    files: list,
+    train_dates: list[str],
+    instruments: list[str],
+    cfg: PipelineConfig,
+    n_jobs: int,
+    pthreads: int,
+    save_path: Path,
+) -> Tokenizer:
+    """Run calibration stage in parallel, fit Tokenizer, persist to disk."""
+    print("--- Calibrating tokenizer ---")
+    cal_days = cfg.calibration_days
+    cal_dates = train_dates[:cal_days] if cal_days is not None else train_dates
+    cal_files = [(p, d) for p, d in files if d in set(cal_dates)]
+
+    cal_tasks = [(p, d, instruments, cfg) for p, d in cal_files]
+    cal_results = _run_parallel(
+        _calibration_payload, cal_tasks, n_jobs, pthreads, desc="Calibrate",
+    )
+    feature_frames = [r[0] for r in cal_results]
+    adv_per_day: dict[str, list[float]] = {}
+    for _, day_adv in cal_results:
+        for sec, dv in day_adv.items():
+            adv_per_day.setdefault(sec, []).append(dv)
+
+    tokenizer = Tokenizer.fit_from_features(
+        pl.concat(feature_frames), adv_per_day, cfg,
+    )
+    tokenizer.save(save_path)
+    print(f"  Saved tokenizer to {save_path}")
+    return tokenizer
+
+
+def _seccodes_in_files(files: list, cfg: PipelineConfig) -> set[str]:
+    """Lightweight scan: union of SECCODEs present across all files (lazy)."""
+    present: set[str] = set()
+    for path, date in files:
+        codes = (
+            _base_scan(path, date, cfg)
+            .select("SECCODE").unique().collect()["SECCODE"].to_list()
+        )
+        present.update(codes)
+    return present
+
+
+def _validate_instruments_present(
+    files: list, instruments: list[str], cfg: PipelineConfig, *, strict: bool = False,
+) -> None:
+    """Verify all `instruments` appear in the raw data. Warn (or raise) on misses."""
+    present = _seccodes_in_files(files, cfg)
+    missing = [s for s in instruments if s not in present]
+    if not missing:
+        return
+    head = ", ".join(missing[:5]) + (" ..." if len(missing) > 5 else "")
+    msg = (
+        f"{len(missing)}/{len(instruments)} instruments missing from data: [{head}]. "
+        f"They will be silently skipped during tokenisation."
+    )
+    if strict:
+        raise RuntimeError(msg)
+    print(f"  WARNING: {msg}")
+
+
 def _featurise_day_from_loaded(df: pl.DataFrame, cfg: PipelineConfig) -> pl.DataFrame:
     """Same as _featurise_day but skips the load step (df already in memory)."""
     df = compute_ewvwap(df, cfg)
@@ -164,8 +227,15 @@ def _run_parallel(fn, tasks, n_jobs, polars_threads, desc):
 def run_pipeline(
     cfg: PipelineConfig | None = None,
     reuse_tokenizer: bool = False,
+    instruments_whitelist: list[str] | None = None,
 ) -> Tokenizer:
-    """Execute full pipeline. Returns the fitted (or loaded) Tokenizer."""
+    """Execute full pipeline. Returns the fitted (or loaded) Tokenizer.
+
+    Instrument selection priority:
+      1. If `reuse_tokenizer` and `tokenizer.json` exists → use tokenizer's instruments.
+      2. Else if `instruments_whitelist` provided → use it.
+      3. Else → `select_instruments(files, cfg)` (top-N by event count).
+    """
     if cfg is None:
         cfg = PipelineConfig()
 
@@ -173,14 +243,12 @@ def run_pipeline(
     n_jobs = max(1, int(cfg.n_jobs))
     pthreads = max(1, int(cfg.polars_threads_per_worker))
 
-    # 1. Discover files and select instruments ------------------------------
+    # 1. Discover files ------------------------------------------------------
     print("--- Discovering data ---")
     files = discover_files(cfg)
     sorted_dates = [date for _, date in files]
     print(f"  Found {len(files)} day(s): {sorted_dates[0]} .. {sorted_dates[-1]}")
     print(f"  Parallelism: n_jobs={n_jobs}, POLARS_MAX_THREADS/worker={pthreads}")
-
-    instruments = select_instruments(files, cfg)
 
     # 2. Date split ---------------------------------------------------------
     n_dates = len(sorted_dates)
@@ -199,33 +267,27 @@ def run_pipeline(
     os.makedirs(seq_dir, exist_ok=True)
     tokenizer_path = Path(cfg.output_dir) / "tokenizer.json"
 
-    # 3. Tokenizer: load or fit --------------------------------------------
+    # 3. Resolve instruments + tokenizer (3 paths, see docstring) -----------
     if reuse_tokenizer and tokenizer_path.exists():
         print(f"--- Loading tokenizer from {tokenizer_path} ---")
         tokenizer = Tokenizer.load(tokenizer_path, cfg=cfg)
+        instruments = tokenizer.instruments
+        print(f"  Reusing {len(instruments)} instruments from tokenizer")
+        if instruments_whitelist is not None:
+            print(f"  NOTE: --instruments ignored (tokenizer is the source of truth)")
+        _validate_instruments_present(files, instruments, cfg, strict=False)
+    elif instruments_whitelist is not None:
+        instruments = list(instruments_whitelist)
+        print(f"--- Using {len(instruments)} whitelist instruments ---")
+        _validate_instruments_present(files, instruments, cfg, strict=True)
+        tokenizer = _fit_tokenizer(
+            files, train_dates, instruments, cfg, n_jobs, pthreads, tokenizer_path,
+        )
     else:
-        print("--- Calibrating tokenizer ---")
-        cal_days = cfg.calibration_days
-        cal_dates = train_dates[:cal_days] if cal_days is not None else train_dates
-        cal_files = [(p, d) for p, d in files if d in set(cal_dates)]
-
-        cal_tasks = [(p, d, instruments, cfg) for p, d in cal_files]
-        cal_results = _run_parallel(
-            _calibration_payload, cal_tasks, n_jobs, pthreads, desc="Calibrate",
+        instruments = select_instruments(files, cfg)
+        tokenizer = _fit_tokenizer(
+            files, train_dates, instruments, cfg, n_jobs, pthreads, tokenizer_path,
         )
-
-        feature_frames = [r[0] for r in cal_results]
-        adv_per_day: dict[str, list[float]] = {}
-        for _, day_adv in cal_results:
-            for sec, dv in day_adv.items():
-                adv_per_day.setdefault(sec, []).append(dv)
-
-        tokenizer = Tokenizer.fit_from_features(
-            pl.concat(feature_frames), adv_per_day, cfg,
-        )
-        tokenizer.save(tokenizer_path)
-        print(f"  Saved tokenizer to {tokenizer_path}")
-        del cal_results, feature_frames
 
     # 4. Per-day processing (parallel) --------------------------------------
     print("--- Processing days ---")
@@ -276,7 +338,11 @@ if __name__ == "__main__":
     parser.add_argument("--top-n-instruments", type=int, default=None,
                         help="Keep only top-N most active instruments (smoke: 2)")
     parser.add_argument("--reuse-tokenizer", action="store_true",
-                        help="Skip calibration if data/processed/tokenizer.json exists")
+                        help="Skip calibration if data/processed/tokenizer.json exists. "
+                             "Also reuses tokenizer's instrument list (overrides top-N selection).")
+    parser.add_argument("--instruments", type=str, default=None,
+                        help="Comma-separated SECCODE whitelist. Overrides top-N selection. "
+                             "Ignored when --reuse-tokenizer is set.")
     args = parser.parse_args()
 
     cfg = PipelineConfig()
@@ -291,4 +357,5 @@ if __name__ == "__main__":
     if args.top_n_instruments is not None:
         cfg.top_n_instruments = args.top_n_instruments
 
-    run_pipeline(cfg, reuse_tokenizer=args.reuse_tokenizer)
+    whitelist = [s.strip() for s in args.instruments.split(",")] if args.instruments else None
+    run_pipeline(cfg, reuse_tokenizer=args.reuse_tokenizer, instruments_whitelist=whitelist)
