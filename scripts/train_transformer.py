@@ -10,15 +10,15 @@ Usage examples:
     python -m scripts.train_transformer --config configs/smoke.json \\
         --device cpu --allow-cpu --amp none --max-steps 30
 
-    # 4×H100 on the cluster
-    CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc-per-node=4 \\
-        -m scripts.train_transformer --config configs/cluster.json \\
+    # 8×H100 on the cluster (production: Muon optimizer, ~52M params)
+    CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --standalone --nproc-per-node=8 \\
+        -m scripts.train_transformer --config configs/base_50m.json \\
         --amp bf16 --num-workers 8
 
     # Resume
-    CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc-per-node=4 \\
-        -m scripts.train_transformer --config configs/cluster.json \\
-        --resume checkpoints/last.pt
+    CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --standalone --nproc-per-node=8 \\
+        -m scripts.train_transformer --config configs/base_50m.json \\
+        --resume checkpoints/transformer_50m/last.pt
 
 GPU SELECTION
 -------------
@@ -425,7 +425,7 @@ def main():
                         help="Resume from a checkpoint (.pt)")
     parser.add_argument("--run-name", type=str, default=None,
                         help="TensorBoard run name (default: timestamp)")
-    # Smoke / experiment overrides for cfg fields (so you can reuse base.json on small data)
+    # Smoke / experiment overrides for cfg fields (so you can reuse base_*.json on small data)
     parser.add_argument("--max-epochs", type=int, default=None,
                         help="Override cfg.max_epochs")
     parser.add_argument("--batch-size", type=int, default=None,
