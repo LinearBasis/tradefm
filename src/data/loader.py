@@ -43,9 +43,22 @@ def extract_date_from_filename(path: str | Path) -> str:
 
 
 def _base_scan(path: Path, date: str, cfg: PipelineConfig) -> pl.LazyFrame:
-    """Lazy-scan one CSV/TXT, add date, parse time, filter auctions."""
+    """Lazy-scan one CSV/TXT/Parquet file, add date, parse time, filter auctions.
+
+    Parquet schema is expected to match _CSV_DTYPES; columns are cast non-strictly
+    so int/float widths can vary across sources (e.g. Int32 vs Int64).
+    """
+    suffix = Path(path).suffix.lower()
+    if suffix == ".parquet":
+        scan = pl.scan_parquet(str(path))
+        present = set(scan.collect_schema().names())
+        casts = [pl.col(c).cast(t, strict=False) for c, t in _CSV_DTYPES.items() if c in present]
+        if casts:
+            scan = scan.with_columns(casts)
+    else:
+        scan = pl.scan_csv(str(path), schema_overrides=_CSV_DTYPES)
     return (
-        pl.scan_csv(str(path), schema_overrides=_CSV_DTYPES)
+        scan
         .with_columns(pl.lit(date).alias("date"))
         .with_columns(time_sec=parse_time_to_seconds(pl.col("TIME")))
         .filter(
@@ -57,10 +70,16 @@ def _base_scan(path: Path, date: str, cfg: PipelineConfig) -> pl.LazyFrame:
 
 
 def discover_files(cfg: PipelineConfig) -> list[tuple[Path, str]]:
-    """Find data files and extract dates. Returns sorted list of (path, date)."""
+    """Find data files and extract dates. Returns sorted list of (path, date).
+
+    Supports .csv, .txt, and .parquet. Mixed extensions in the same dir are fine —
+    all are merged into one sorted list, with date inferred from the filename.
+    """
     raw_dir = Path(cfg.raw_dir)
     data_files = sorted(
-        list(raw_dir.glob("*.csv")) + list(raw_dir.glob("*.txt"))
+        list(raw_dir.glob("*.csv"))
+        + list(raw_dir.glob("*.txt"))
+        + list(raw_dir.glob("*.parquet"))
     ) if raw_dir.is_dir() else []
 
     if data_files:
