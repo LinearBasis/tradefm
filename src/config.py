@@ -38,6 +38,10 @@ class ModelConfig:
     # Apply RMSNorm to Q and K before SDPA (Gemma 2 / DeepSeek-V4 style).
     # Stabilizes training, plays well with Muon. Default off → old checkpoints compatible.
     qk_norm: bool = False
+    # torch.compile the model (TorchDynamo + Inductor → fused Triton kernels).
+    # First forward is ~30-90s (cached across runs). 1.3-1.8× speedup on H100.
+    # Default off so smoke runs and debugging stay snappy; flip on for production.
+    use_compile: bool = False
 
     # --- Vocab (derived from PipelineConfig, but stored for standalone use) ---
     vocab_size: int = 16_384

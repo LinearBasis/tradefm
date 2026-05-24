@@ -77,13 +77,14 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary(q, cos, sin)
         k = apply_rotary(k, cos, sin)
 
-        if self.n_rep > 1:
-            k = k.repeat_interleave(self.n_rep, dim=1)
-            v = v.repeat_interleave(self.n_rep, dim=1)
-
+        # Native GQA in SDPA (PyTorch 2.5+): broadcast K/V channels inside the
+        # kernel instead of materialising n_rep× larger tensors via
+        # repeat_interleave. Saves activation memory and a few % per attention
+        # call on Flash-Attention 2 (H100).
         out = F.scaled_dot_product_attention(
             q, k, v, is_causal=True,
             dropout_p=self.attn_drop if self.training else 0.0,
+            enable_gqa=self.n_rep > 1,
         )  # (B, n_heads, T, d_head)
         out = out.transpose(1, 2).reshape(B, T, self.n_heads * self.d_head)
         return self.resid_drop(self.out_proj(out))

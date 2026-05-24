@@ -106,6 +106,22 @@ def _is_main(rank: int) -> bool:
     return rank == 0
 
 
+def _unwrap(m: nn.Module) -> nn.Module:
+    """Peel DDP (.module) and torch.compile (._orig_mod) layers in any order.
+
+    Use everywhere we need the bare OrderFlowTransformer — building optimizer
+    groups, saving state_dict, loading state_dict on resume, calling helpers
+    like extract_latent. Idempotent on unwrapped models.
+    """
+    while True:
+        if hasattr(m, "_orig_mod"):
+            m = m._orig_mod
+        elif hasattr(m, "module") and isinstance(m, nn.parallel.DistributedDataParallel):
+            m = m.module
+        else:
+            return m
+
+
 def _all_reduce_mean(value: float, world_size: int, device: torch.device) -> float:
     """Reduce a scalar across ranks, returning mean."""
     if world_size == 1:
@@ -269,7 +285,7 @@ def _run_stylized_fact_rollout(
     seed_liq = int(seed["liquidities"][0])
     inst_id = int(seed["instrument_id"])
 
-    underlying = model.module if hasattr(model, "module") else model
+    underlying = _unwrap(model)
     mids_all, ts_all = [], []
     for i in range(cfg.rollout_n_rollouts):
         torch.manual_seed(epoch * 1000 + i)
@@ -416,6 +432,8 @@ def main():
                         help="Stop after this many optimizer steps (smoke-test utility)")
     parser.add_argument("--resume", type=str, default=None,
                         help="Resume from a checkpoint (.pt)")
+    parser.add_argument("--compile", default=None, action=argparse.BooleanOptionalAction,
+                        help="Override cfg.use_compile. --compile / --no-compile.")
     parser.add_argument("--run-name", type=str, default=None,
                         help="TensorBoard run name (default: timestamp)")
     # Smoke / experiment overrides for cfg fields (so you can reuse base_*.json on small data)
@@ -514,7 +532,7 @@ def main():
                     find_unused_parameters=False)
 
     opt_kind = getattr(cfg, "optimizer", "adamw")
-    target_model = model.module if use_ddp else model
+    target_model = _unwrap(model)
     if opt_kind == "adamw":
         # nanoGPT/Llama convention: only 2D matmul weights get weight_decay.
         # Embeddings, RMSNorm scales, and biases get decay=0 — decaying them is
@@ -525,7 +543,7 @@ def main():
                 {"params": decay_p, "weight_decay": cfg.weight_decay},
                 {"params": no_decay_p, "weight_decay": 0.0},
             ],
-            lr=cfg.lr, betas=cfg.betas,
+            lr=cfg.lr, betas=cfg.betas, fused=True,
         )
         if _is_main(rank):
             n_decay = sum(p.numel() for p in decay_p)
@@ -558,6 +576,15 @@ def main():
     for pg in optimizer.param_groups:
         pg["base_lr"] = pg["lr"]
 
+    # torch.compile AFTER optimizer construction: param refs are already bound
+    # via the bare model, compile only wraps the forward graph. _unwrap() peels
+    # the _orig_mod layer transparently for state_dict save/load.
+    do_compile = args.compile if args.compile is not None else getattr(cfg, "use_compile", False)
+    if do_compile:
+        if _is_main(rank):
+            print("Compiling model with torch.compile (first forward ~30-90s, then cached)...")
+        model = torch.compile(model)
+
     scaler = torch.amp.GradScaler("cuda") if (amp_dtype == torch.float16) else None
 
     steps_per_epoch = len(train_loader)
@@ -589,7 +616,7 @@ def main():
         ck = torch.load(rp, map_location=device, weights_only=False)
         # DDP: state_dict keys may have "module." prefix
         sd = ck["model_state_dict"]
-        target = model.module if use_ddp else model
+        target = _unwrap(model)
         # strict=False so newly enabled optional modules (e.g. QK-norm)
         # get their fresh defaults when resuming from an older checkpoint.
         missing, unexpected = target.load_state_dict(sd, strict=False)
@@ -658,7 +685,7 @@ def main():
                 _run_stylized_fact_rollout(model, val_ds, cfg, device, writer, epoch)
 
             # Always save "last", and "best" when improved
-            sd = (model.module if use_ddp else model).state_dict()
+            sd = (_unwrap(model)).state_dict()
             torch.save({
                 "epoch": epoch,
                 "step": step,

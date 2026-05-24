@@ -9,6 +9,7 @@
   "dropout": 0.1,
   "qk_norm": true,
   "use_instrument_emb": false,
+  "use_compile": true,
 
   "batch_size": 96,
   "lr": 4e-4,
