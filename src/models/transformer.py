@@ -8,7 +8,7 @@ from src.config import ModelConfig
 
 
 class RMSNorm(nn.Module):
-    """Standard RMSNorm. Used for optional QK-norm in attention (Gemma 2 / DeepSeek-V4 style)."""
+    """RMSNorm. Used for block norms (Llama-faithful) and optional QK-norm."""
 
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -104,13 +104,16 @@ class SwiGLU(nn.Module):
 
 
 class PreNormBlock(nn.Module):
-    """Pre-LayerNorm Transformer decoder block (GQA + SwiGLU + RoPE)."""
+    """Pre-norm Transformer decoder block (RMSNorm + GQA + SwiGLU + RoPE).
+
+    RMSNorm matches Llama-family convention (paper §7.1 "based on the Llama family").
+    """
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
-        self.ln1 = nn.LayerNorm(cfg.d_model)
+        self.ln1 = RMSNorm(cfg.d_model)
         self.attn = CausalSelfAttention(cfg)
-        self.ln2 = nn.LayerNorm(cfg.d_model)
+        self.ln2 = RMSNorm(cfg.d_model)
         self.ffn = SwiGLU(cfg)
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
@@ -164,8 +167,8 @@ class OrderFlowTransformer(nn.Module):
         # Transformer blocks
         self.blocks = nn.ModuleList([PreNormBlock(cfg) for _ in range(cfg.n_layers)])
 
-        # Final layer norm
-        self.ln_f = nn.LayerNorm(cfg.d_model)
+        # Final norm
+        self.ln_f = RMSNorm(cfg.d_model)
 
         # Output head (weight-tied with token embedding)
         self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
@@ -180,7 +183,11 @@ class OrderFlowTransformer(nn.Module):
         return freqs.cos(), freqs.sin()
 
     def _init_weights(self):
-        """Initialize weights following GPT-2 conventions."""
+        """Initialize weights following GPT-2 conventions.
+
+        RMSNorm self-initializes its `weight` to ones in __init__; no explicit
+        norm branch needed here.
+        """
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
@@ -188,9 +195,6 @@ class OrderFlowTransformer(nn.Module):
                     nn.init.zeros_(module.bias)
             elif isinstance(module, nn.Embedding):
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            elif isinstance(module, nn.LayerNorm):
-                nn.init.ones_(module.weight)
-                nn.init.zeros_(module.bias)
 
     def _context(
         self,

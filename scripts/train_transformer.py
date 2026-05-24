@@ -45,7 +45,7 @@ from src.config import ModelConfig
 from src.data.dataset import OrderFlowDataset
 from src.data.tokenizer import Tokenizer, subtoken_factors
 from src.eval.stylized_facts import compute_stylized_facts, run_rollout
-from src.training.muon import HybridMuonAdamW
+from src.training.muon import HybridMuonAdamW, split_params_for_muon
 from src.models.transformer import OrderFlowTransformer
 
 
@@ -535,13 +535,28 @@ def main():
                     find_unused_parameters=False)
 
     opt_kind = getattr(cfg, "optimizer", "adamw")
+    target_model = model.module if use_ddp else model
     if opt_kind == "adamw":
+        # nanoGPT/Llama convention: only 2D matmul weights get weight_decay.
+        # Embeddings, RMSNorm scales, and biases get decay=0 — decaying them is
+        # a known antipattern (norms drift toward 0, embeddings lose magnitude).
+        decay_p, no_decay_p, decay_names, no_decay_names = split_params_for_muon(target_model)
         optimizer = torch.optim.AdamW(
-            model.parameters(), lr=cfg.lr,
-            weight_decay=cfg.weight_decay, betas=cfg.betas,
+            [
+                {"params": decay_p, "weight_decay": cfg.weight_decay},
+                {"params": no_decay_p, "weight_decay": 0.0},
+            ],
+            lr=cfg.lr, betas=cfg.betas,
         )
+        if _is_main(rank):
+            n_decay = sum(p.numel() for p in decay_p)
+            n_no = sum(p.numel() for p in no_decay_p)
+            print(f"Optimizer: adamw | decay {n_decay:,} | no-decay {n_no:,} "
+                  f"(embeddings/norms/biases)")
     elif opt_kind == "muon_hybrid":
-        target_model = model.module if use_ddp else model
+        # Muon sees 2D matmul weights (its own muon_weight_decay applies).
+        # AdamW side only sees embeddings/norms/biases → those must NOT get
+        # weight decay (same Llama convention).
         optimizer = HybridMuonAdamW(
             target_model,
             muon_lr=cfg.muon_lr,
@@ -549,13 +564,14 @@ def main():
             muon_weight_decay=cfg.muon_weight_decay,
             muon_update_rescale=cfg.muon_update_rescale,
             adamw_lr=cfg.lr,
-            adamw_weight_decay=cfg.weight_decay,
+            adamw_weight_decay=0.0,
             adamw_betas=cfg.betas,
         )
         if _is_main(rank):
             n_muon = sum(p.numel() for p in optimizer.muon.param_groups[0]["params"])
             n_adamw = sum(p.numel() for p in optimizer.adamw.param_groups[0]["params"])
-            print(f"Optimizer: muon_hybrid | Muon params: {n_muon:,} | AdamW params: {n_adamw:,}")
+            print(f"Optimizer: muon_hybrid | Muon params: {n_muon:,} "
+                  f"(decay {cfg.muon_weight_decay}) | AdamW params: {n_adamw:,} (decay 0)")
     else:
         raise ValueError(f"Unknown optimizer: {opt_kind!r} (expected 'adamw' or 'muon_hybrid')")
 
