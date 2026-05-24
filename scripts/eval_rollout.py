@@ -147,8 +147,19 @@ def main():
         all_gens.append(gen)
 
     gen_pool = {k: np.concatenate([g[k] for g in all_gens]) for k in all_gens[0].keys()}
-    returns = np.diff(gen_pool["mid"]) / gen_pool["mid"][:-1]
-    sf = compute_stylized_facts(returns)
+    # Per-rollout stylized facts, then average. Don't concatenate (m1, m2)
+    # across rollouts — the join boundary fakes a non-physical log return.
+    sf_list = [compute_stylized_facts(g["mid"], g["ts"]) for g in all_gens]
+
+    def _mean(key):
+        vals = [s[key] for s in sf_list if np.isfinite(s[key])]
+        return float(np.mean(vals)) if vals else float("nan")
+
+    def _mean_lag(key, idx):
+        vals = [float(s[key][idx]) for s in sf_list
+                if len(s[key]) > idx and np.isfinite(s[key][idx])]
+        return float(np.mean(vals)) if vals else float("nan")
+
     fidelity = compute_distributional_fidelity(
         real_dist, gen_pool, quantities=("iat", "depth", "vol"),
     )
@@ -160,14 +171,15 @@ def main():
         "temperature": args.temperature,
         "repetition_penalty": args.repetition_penalty,
         "stylized_facts": {
-            "kurtosis": sf["kurtosis"],
-            "kurtosis_agg_2": sf["kurtosis_agg_2"],
-            "kurtosis_agg_5": sf["kurtosis_agg_5"],
-            "kurtosis_agg_10": sf["kurtosis_agg_10"],
-            "acf_returns_lag1": float(sf["acf_returns"][1]) if len(sf["acf_returns"]) > 1 else float("nan"),
-            "acf_returns_lag5": float(sf["acf_returns"][min(5, len(sf["acf_returns"]) - 1)]),
-            "acf_abs_returns_lag1": float(sf["acf_abs_returns"][1]) if len(sf["acf_abs_returns"]) > 1 else float("nan"),
-            "acf_abs_returns_lag5": float(sf["acf_abs_returns"][min(5, len(sf["acf_abs_returns"]) - 1)]),
+            "kurtosis_event": _mean("kurtosis_event"),
+            "kurtosis_10s": _mean("kurtosis_10s"),
+            "kurtosis_30s": _mean("kurtosis_30s"),
+            "kurtosis_60s": _mean("kurtosis_60s"),
+            "kurtosis_120s": _mean("kurtosis_120s"),
+            "acf_returns_lag1": _mean_lag("acf_returns", 1),
+            "acf_returns_lag5": _mean_lag("acf_returns", 5),
+            "acf_abs_returns_lag1": _mean_lag("acf_abs_returns", 1),
+            "acf_abs_returns_lag5": _mean_lag("acf_abs_returns", 5),
         },
         "rollout_aggregates": {
             "mean_iat": float(gen_pool["iat"].mean()),

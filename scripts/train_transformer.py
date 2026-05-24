@@ -270,7 +270,7 @@ def _run_stylized_fact_rollout(
     inst_id = int(seed["instrument_id"])
 
     underlying = model.module if hasattr(model, "module") else model
-    all_returns = []
+    mids_all, ts_all = [], []
     for i in range(cfg.rollout_n_rollouts):
         torch.manual_seed(epoch * 1000 + i)
         gen = run_rollout(
@@ -280,18 +280,32 @@ def _run_stylized_fact_rollout(
             init_mid=cfg.rollout_init_mid, n_events=cfg.rollout_n_events,
             device=device,
         )
-        r = np.diff(gen["mid"]) / gen["mid"][:-1]
-        all_returns.append(r)
-    returns = np.concatenate(all_returns)
-    sf = compute_stylized_facts(returns)
+        # Append rollouts as independent segments (no log-return across boundary).
+        mids_all.append(gen["mid"])
+        ts_all.append(gen["ts"])
+
+    # Compute stylized facts per-rollout, average ACF/kurtosis across rollouts
+    # (avoids artefacts of joining independent trajectories at their boundaries).
+    sf_list = [compute_stylized_facts(m, t) for m, t in zip(mids_all, ts_all)]
+    def _mean(key):
+        vals = [s[key] for s in sf_list if np.isfinite(s[key])]
+        return float(np.mean(vals)) if vals else float("nan")
+    def _mean_arr(key, idx):
+        vals = [s[key][idx] for s in sf_list if len(s[key]) > idx and np.isfinite(s[key][idx])]
+        return float(np.mean(vals)) if vals else float("nan")
+
+    kurt_60 = _mean("kurtosis_60s")
+    acf_r1 = _mean_arr("acf_returns", 1)
+    acf_a1 = _mean_arr("acf_abs_returns", 1)
 
     if writer is not None:
-        writer.add_scalar("rollout/kurtosis", sf["kurtosis"], epoch)
-        writer.add_scalar("rollout/kurtosis_agg_5", sf["kurtosis_agg_5"], epoch)
-        writer.add_scalar("rollout/acf_returns_lag1", float(sf["acf_returns"][1]), epoch)
-        writer.add_scalar("rollout/acf_abs_returns_lag1", float(sf["acf_abs_returns"][1]), epoch)
-    print(f"  [rollout] kurtosis={sf['kurtosis']:.2f}, "
-          f"acf_r[1]={sf['acf_returns'][1]:+.3f}, acf_|r|[1]={sf['acf_abs_returns'][1]:+.3f}")
+        writer.add_scalar("rollout/kurtosis_10s", _mean("kurtosis_10s"), epoch)
+        writer.add_scalar("rollout/kurtosis_60s", kurt_60, epoch)
+        writer.add_scalar("rollout/kurtosis_120s", _mean("kurtosis_120s"), epoch)
+        writer.add_scalar("rollout/acf_returns_lag1", acf_r1, epoch)
+        writer.add_scalar("rollout/acf_abs_returns_lag1", acf_a1, epoch)
+    print(f"  [rollout] kurt_60s={kurt_60:.2f}, "
+          f"acf_r[1]={acf_r1:+.3f}, acf_|r|[1]={acf_a1:+.3f}")
 
 
 def _decompose_token(tok: torch.Tensor, factors: tuple[int, int, int, int, int]):

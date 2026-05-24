@@ -106,7 +106,7 @@ def run_rollout(
     hist_liq = [seed_liquidity] * len(hist_tokens)
 
     out = {k: [] for k in (
-        "mid", "spread", "obi", "bid_vol", "ask_vol",
+        "ts", "mid", "spread", "obi", "bid_vol", "ask_vol",
         "iat", "depth", "vol", "action", "side", "token",
     )}
 
@@ -140,6 +140,7 @@ def run_rollout(
         hist_plevels.append(new_plevel)
         hist_liq.append(seed_liquidity)
 
+        out["ts"].append(snap["ts"])
         out["mid"].append(snap["mid"])
         out["spread"].append(snap["spread"])
         out["obi"].append(snap["obi"])
@@ -159,49 +160,102 @@ def run_rollout(
 # Stylized facts                                                               #
 # --------------------------------------------------------------------------- #
 
-def compute_stylized_facts(returns: np.ndarray, max_lag: int = 50) -> dict:
-    """ACF of returns + ACF of |returns| + kurtosis at increasing aggregation."""
-    returns = returns[np.isfinite(returns)]
-    n = len(returns)
-    if n < 3:
-        return {
-            "acf_returns": np.array([1.0]),
-            "acf_abs_returns": np.array([1.0]),
-            "kurtosis": float("nan"),
-            "kurtosis_agg_2": float("nan"),
-            "kurtosis_agg_5": float("nan"),
-            "kurtosis_agg_10": float("nan"),
-        }
-    max_lag = min(max_lag, n - 2)
-    abs_returns = np.abs(returns)
+def _resample_log_returns(mid: np.ndarray, ts: np.ndarray, delta_t: float) -> np.ndarray:
+    """Step-interpolate mid(t) onto a uniform Δt-second grid, return log returns.
 
-    def acf(x, lags):
-        out = np.zeros(lags + 1)
-        x_centered = x - x.mean()
-        var = (x_centered ** 2).sum()
+    Grid: ts[0], ts[0]+Δt, ..., ts[-1]. At each grid point, takes the last
+    observed mid with ts <= grid_point (right-continuous step function).
+    """
+    if len(mid) < 2 or delta_t <= 0:
+        return np.array([])
+    t0, t1 = float(ts[0]), float(ts[-1])
+    if t1 - t0 < delta_t:
+        return np.array([])
+    n_grid = int((t1 - t0) / delta_t) + 1
+    grid = t0 + np.arange(n_grid) * delta_t
+    idx = np.searchsorted(ts, grid, side="right") - 1
+    idx = np.clip(idx, 0, len(mid) - 1)
+    mid_on_grid = mid[idx]
+    finite = (mid_on_grid > 0) & np.isfinite(mid_on_grid)
+    if finite.sum() < 2:
+        return np.array([])
+    log_ret = np.diff(np.log(mid_on_grid))
+    return log_ret[np.isfinite(log_ret)]
+
+
+def compute_stylized_facts(
+    mid: np.ndarray,
+    ts: np.ndarray,
+    delta_t_seconds: tuple[float, ...] = (10.0, 30.0, 60.0, 120.0),
+    acf_delta_t: float = 1.0,
+    max_lag: int = 50,
+) -> dict:
+    """Paper-§9.1 stylized facts on simulated log returns.
+
+    - ACF(returns) and ACF(|returns|): on log returns resampled at `acf_delta_t`
+      seconds (default 1s). Lags are in units of `acf_delta_t`.
+    - kurtosis at multiple Δt_r: wall-clock time aggregation per paper Fig. 4
+      (right panel) — log returns resampled at each Δt and kurtosis computed.
+
+    Both use step-interpolation of mid(t) onto a uniform grid, which is what
+    you want for a non-uniform event stream: kurtosis_10s means "kurtosis of
+    10-second log returns" regardless of underlying event rate.
+    """
+    mid = np.asarray(mid, dtype=np.float64)
+    ts = np.asarray(ts, dtype=np.float64)
+    finite = np.isfinite(mid) & (mid > 0) & np.isfinite(ts)
+    mid = mid[finite]
+    ts = ts[finite]
+    if len(mid) < 3:
+        empty = np.array([1.0])
+        return {
+            "acf_returns": empty,
+            "acf_abs_returns": empty,
+            "kurtosis_event": float("nan"),
+            **{f"kurtosis_{int(d)}s": float("nan") for d in delta_t_seconds},
+        }
+
+    # Per-event log returns — kept as informational baseline kurtosis.
+    event_log_ret = np.diff(np.log(mid))
+    event_log_ret = event_log_ret[np.isfinite(event_log_ret)]
+
+    # ACF on Δt-resampled log returns (paper Fig. 4 left + middle, x in seconds).
+    acf_ret = _resample_log_returns(mid, ts, acf_delta_t)
+    n_acf = len(acf_ret)
+    lags = min(max_lag, max(n_acf - 2, 1))
+
+    def acf(x, n_lags):
+        out = np.zeros(n_lags + 1)
+        if len(x) < 2:
+            out[0] = 1.0
+            return out
+        x_c = x - x.mean()
+        var = (x_c ** 2).sum()
         if var == 0:
             out[0] = 1.0
             return out
-        for k in range(lags + 1):
-            out[k] = (x_centered[: n - k] * x_centered[k:]).sum() / var
+        n = len(x)
+        for k in range(n_lags + 1):
+            out[k] = (x_c[: n - k] * x_c[k:]).sum() / var
         return out
 
-    def agg_kurt(step):
-        if n < 2 * step + 2:
-            return float("nan")
-        # Sum every `step` consecutive returns (proxy for time aggregation)
-        trimmed = returns[: (n // step) * step].reshape(-1, step).sum(axis=1)
-        if len(trimmed) < 4:
-            return float("nan")
-        return float(stats.kurtosis(trimmed))
+    acf_r = acf(acf_ret, lags)
+    acf_abs = acf(np.abs(acf_ret), lags)
+
+    # Wall-clock kurtosis at multiple Δt (paper Fig. 4 right).
+    kurts = {}
+    for d in delta_t_seconds:
+        ret_d = _resample_log_returns(mid, ts, d)
+        kurts[f"kurtosis_{int(d)}s"] = (
+            float(stats.kurtosis(ret_d)) if len(ret_d) >= 4 else float("nan")
+        )
 
     return {
-        "acf_returns": acf(returns, max_lag),
-        "acf_abs_returns": acf(abs_returns, max_lag),
-        "kurtosis": float(stats.kurtosis(returns)),
-        "kurtosis_agg_2": agg_kurt(2),
-        "kurtosis_agg_5": agg_kurt(5),
-        "kurtosis_agg_10": agg_kurt(10),
+        "acf_returns": acf_r,
+        "acf_abs_returns": acf_abs,
+        "acf_delta_t": acf_delta_t,
+        "kurtosis_event": float(stats.kurtosis(event_log_ret)) if len(event_log_ret) >= 4 else float("nan"),
+        **kurts,
     }
 
 
@@ -214,7 +268,13 @@ def compute_distributional_fidelity(
     gen: dict[str, np.ndarray],
     quantities: Iterable[str] = ("spread", "iat", "depth", "vol", "obi", "bid_vol", "ask_vol"),
 ) -> dict[str, dict[str, float]]:
-    """Per-quantity K-S statistic and Wasserstein-1 distance between real and gen distributions."""
+    """Per-quantity K-S statistic and Wasserstein-1 distance between real and gen.
+
+    K-S is scale-invariant (operates on CDFs) → reported on raw values.
+    W₁ is in units of the underlying quantity → paper §9.2 mean-variance
+    normalises both distributions by the **real** distribution's stats before
+    W₁ to make the metric comparable across quantities (bp vs shs etc.).
+    """
     out: dict[str, dict[str, float]] = {}
     for q in quantities:
         if q not in real or q not in gen:
@@ -225,6 +285,10 @@ def compute_distributional_fidelity(
             out[q] = {"ks": float("nan"), "w1": float("nan")}
             continue
         ks_stat, _ = stats.ks_2samp(r, g)
-        w1 = stats.wasserstein_distance(r, g)
+        mu, sd = float(r.mean()), float(r.std())
+        if sd > 0:
+            w1 = stats.wasserstein_distance((r - mu) / sd, (g - mu) / sd)
+        else:
+            w1 = stats.wasserstein_distance(r, g)
         out[q] = {"ks": float(ks_stat), "w1": float(w1)}
     return out
