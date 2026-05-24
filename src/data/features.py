@@ -148,8 +148,12 @@ def build_order_features(df: pl.DataFrame, cfg: PipelineConfig) -> pl.DataFrame:
       - side: 0=buy, 1=sell
       - action: 0=add, 1=cancel
     """
+    # PRICE > 0 drops MOEX market orders (ACTION=1 & PRICE=0) and their cancels.
+    # Without this they'd tokenise as δp = (0-mid)/mid = -1 → low-outlier bin,
+    # polluting bin 0 of price_depth with non-limit-order events.
+    # Matches the convention in src/data/moex_to_hftbacktest.py.
     orders = (
-        df.filter(pl.col("ACTION").is_in([0, 1]))
+        df.filter(pl.col("ACTION").is_in([0, 1]) & (pl.col("PRICE") > 0))
         .filter(pl.col("mid_price").is_not_null())
         .sort(["SECCODE", "date", "NO"])
     )

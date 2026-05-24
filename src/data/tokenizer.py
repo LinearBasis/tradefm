@@ -49,10 +49,49 @@ class Tokenizer:
     (pipeline supports `--reuse-tokenizer`).
     """
 
-    def __init__(self, edges: BinEdges, adv: dict[str, float], cfg: PipelineConfig):
+    def __init__(
+        self,
+        edges: BinEdges,
+        adv: dict[str, float],
+        cfg: PipelineConfig,
+        extents: dict[str, tuple[float, float]] | None = None,
+    ):
         self.edges = edges
         self.adv = adv
         self.cfg = cfg
+        # extents[feature] = (min_observed, max_observed) in the same scale as
+        # edges (log-space for interarrival/volume, linear elsewhere). Used by
+        # the centroid LUT to give honest representatives for outlier bins.
+        self.extents: dict[str, tuple[float, float]] = extents or {}
+        self._centroid_lut: dict[str, np.ndarray] = self._build_centroid_luts()
+
+    def _build_centroid_luts(self) -> dict[str, np.ndarray]:
+        """Precompute centroid value per bin per feature.
+
+        For each bin i, centroid = midpoint(lower_boundary, upper_boundary),
+        where boundaries are [extent_min, *edges, extent_max]. Returns values
+        in the natural (raw) scale: log-space features go through expm1.
+        """
+        spec = {
+            "interarrival": (self.cfg.n_bins_interarrival, True),   # log space
+            "price_depth":  (self.cfg.n_bins_price_depth, False),
+            "volume":       (self.cfg.n_bins_volume, True),         # log space
+            "price_level":  (self.cfg.n_bins_price_level, False),
+            "liquidity":    (self.cfg.n_liquidity_bins, False),
+        }
+        luts: dict[str, np.ndarray] = {}
+        for feat, (n_bins, log_space) in spec.items():
+            edges = np.asarray(getattr(self.edges, feat), dtype=np.float64)
+            if len(edges) == 0:
+                luts[feat] = np.zeros(n_bins)
+                continue
+            # Fall back to edges[0]/edges[-1] if extents missing (old tokenizer.json
+            # files lack them — produces the previous, slightly biased centroids).
+            lo, hi = self.extents.get(feat, (float(edges[0]), float(edges[-1])))
+            bounds = np.concatenate([[lo], edges, [hi]])
+            cent = 0.5 * (bounds[:-1] + bounds[1:])
+            luts[feat] = np.expm1(cent) if log_space else cent
+        return luts
 
     @property
     def instruments(self) -> list[str]:
@@ -78,30 +117,40 @@ class Tokenizer:
         `adv_per_day[seccode]` is the list of per-day daily_volume across training days.
         """
         edges = BinEdges()
+        extents: dict[str, tuple[float, float]] = {}
 
-        # Interarrival: log-uniform single-sided.
+        def _extent(arr: np.ndarray) -> tuple[float, float]:
+            arr = arr[np.isfinite(arr)]
+            return (float(arr.min()), float(arr.max())) if len(arr) else (0.0, 0.0)
+
+        # Interarrival: log-uniform single-sided. Extent stored in log space.
         iat = features["interarrival"].drop_nulls().to_numpy()
         iat = iat[iat > 0]
         iat_log = np.log1p(iat)
         edges.interarrival = _calibrate_one_sided(
             iat_log, cfg.n_bins_interarrival, cfg.outlier_upper_pct,
         )
+        extents["interarrival"] = _extent(iat_log)
 
         # log_volume: already in log-space.
         vol = features["log_volume"].drop_nulls().to_numpy()
         edges.volume = _calibrate_one_sided(
             vol, cfg.n_bins_volume, cfg.outlier_upper_pct,
         )
+        extents["volume"] = _extent(vol)
 
         # Price depth / price level: quantile double-sided.
+        pd_vals = features["price_depth"].drop_nulls().to_numpy()
         edges.price_depth = _calibrate_two_sided(
-            features["price_depth"].drop_nulls().to_numpy(),
-            cfg.n_bins_price_depth, cfg.outlier_lower_pct, cfg.outlier_upper_pct,
+            pd_vals, cfg.n_bins_price_depth, cfg.outlier_lower_pct, cfg.outlier_upper_pct,
         )
+        extents["price_depth"] = _extent(pd_vals)
+
+        pl_vals = features["price_level"].drop_nulls().to_numpy()
         edges.price_level = _calibrate_two_sided(
-            features["price_level"].drop_nulls().to_numpy(),
-            cfg.n_bins_price_level, cfg.outlier_lower_pct, cfg.outlier_upper_pct,
+            pl_vals, cfg.n_bins_price_level, cfg.outlier_lower_pct, cfg.outlier_upper_pct,
         )
+        extents["price_level"] = _extent(pl_vals)
 
         # ADV: per-asset mean of per-day daily volume (paper §6.2).
         adv = {sec: float(np.mean(vals)) for sec, vals in adv_per_day.items()}
@@ -114,8 +163,9 @@ class Tokenizer:
             edges.liquidity = np.quantile(adv_values, qs)
         else:
             edges.liquidity = np.array([])
+        extents["liquidity"] = _extent(adv_values)
 
-        return cls(edges=edges, adv=adv, cfg=cfg)
+        return cls(edges=edges, adv=adv, cfg=cfg, extents=extents)
 
     # ----------------------------------------------------------- transform ---
 
@@ -166,50 +216,19 @@ class Tokenizer:
     # ---------------------------------------------------------- detokenize ---
 
     def bin_centroid(self, feature: str, bin_idx: int) -> float:
-        """Representative continuous value for a bin (midpoint in feature-natural scale).
+        """Representative continuous value for a bin via precomputed LUT.
 
-        For one-sided log features (interarrival, volume), midpoint is computed in
-        log-space and inverted via expm1. For two-sided linear features
-        (price_depth, price_level), midpoint is computed directly.
-        Outlier bins (0 for two-sided, n-1 for both) clip to the corresponding
-        threshold value.
+        Uses observed (min, max) extents from training data to give honest
+        midpoints for outlier bins (bin 0 and bin n-1). For a one-sided log
+        feature, bin 0 = midpoint(min_log, edges[0]), inverted via expm1;
+        previously returned edges[0] itself (upper bound), which was biased.
         """
-        edges = getattr(self.edges, feature)
-        if len(edges) == 0:
+        lut = self._centroid_lut.get(feature)
+        if lut is None or len(lut) == 0:
             return 0.0
-        n_bins = {
-            "interarrival": self.cfg.n_bins_interarrival,
-            "price_depth": self.cfg.n_bins_price_depth,
-            "volume": self.cfg.n_bins_volume,
-            "price_level": self.cfg.n_bins_price_level,
-            "liquidity": self.cfg.n_liquidity_bins,
-        }[feature]
+        n_bins = lut.shape[0]
         bin_idx = int(max(0, min(bin_idx, n_bins - 1)))
-
-        if feature in ("price_depth", "price_level"):
-            # edges = [lo_thr, c_1, ..., c_{n-3}, hi_thr], length n_bins - 1
-            if bin_idx == 0:
-                return float(edges[0])
-            if bin_idx >= n_bins - 1:
-                return float(edges[-1])
-            return float(0.5 * (edges[bin_idx - 1] + edges[bin_idx]))
-        elif feature in ("interarrival", "volume"):
-            # edges = [c_1, ..., c_{n-2}, hi_thr] in log-space, length n_bins - 1
-            if bin_idx == 0:
-                log_v = float(edges[0])  # below first cutpoint -> use first cutpoint as proxy
-            elif bin_idx >= n_bins - 1:
-                log_v = float(edges[-1])
-            else:
-                log_v = float(0.5 * (edges[bin_idx - 1] + edges[bin_idx]))
-            return float(np.expm1(log_v))
-        elif feature == "liquidity":
-            # Plain quantile bins; no outliers. edges length = n_bins - 1.
-            if bin_idx == 0:
-                return float(edges[0])
-            if bin_idx >= n_bins - 1:
-                return float(edges[-1])
-            return float(0.5 * (edges[bin_idx - 1] + edges[bin_idx]))
-        raise ValueError(f"unknown feature {feature!r}")
+        return float(lut[bin_idx])
 
     # ------------------------------------------------------------- persist ---
 
@@ -220,6 +239,9 @@ class Tokenizer:
             "edges": {k: getattr(self.edges, k).tolist() for k in
                       ("interarrival", "price_depth", "volume", "price_level", "liquidity")},
             "adv": self.adv,
+            # Observed (min, max) per feature in the edges' scale (log for
+            # interarrival/volume). Used by bin_centroid for outlier bins.
+            "extents": {k: list(v) for k, v in self.extents.items()},
             # Explicit instruments list (also derivable from adv.keys); written
             # for human-readability and forward-compat.
             "instruments": self.instruments,
@@ -250,12 +272,16 @@ class Tokenizer:
             liquidity=np.array(payload["edges"]["liquidity"], dtype=np.float64),
         )
         adv = {str(k): float(v) for k, v in payload["adv"].items()}
+        # Old tokenizer.json files lack "extents" → bin_centroid silently falls
+        # back to edges[0]/edges[-1] for outlier bins (the previous behaviour).
+        extents_raw = payload.get("extents", {})
+        extents = {k: (float(v[0]), float(v[1])) for k, v in extents_raw.items()}
         if cfg is None:
             cfg = PipelineConfig()
         for k, v in payload["cfg_snapshot"].items():
             if hasattr(cfg, k):
                 setattr(cfg, k, v)
-        return cls(edges=edges, adv=adv, cfg=cfg)
+        return cls(edges=edges, adv=adv, cfg=cfg, extents=extents)
 
 
 # --------------------------------------------------------------------------- #
@@ -319,6 +345,30 @@ def _digitize(values: np.ndarray, edges: np.ndarray) -> np.ndarray:
 # --------------------------------------------------------------------------- #
 # Composite token decode (for diagnostics / per-subtoken accuracy)             #
 # --------------------------------------------------------------------------- #
+
+def decompose_token_torch(token, factors: tuple[int, int, int, int, int]):
+    """Vectorized torch-tensor inverse of compose_trade_token.
+
+    Mirrors decode_trade_token but returns a 5-tuple of tensors instead of a
+    dict, and uses torch.div(rounding_mode='floor') for correct integer
+    division across torch dtypes. Same arithmetic as Tokenizer.transform's
+    composition step (paper §6.2 Eq. 1).
+    """
+    import torch  # local import — tokenizer module stays torch-free otherwise
+    _, n_s, n_d, n_v, n_t = factors
+    block_a = n_s * n_d * n_v * n_t
+    block_s = n_d * n_v * n_t
+    block_d = n_v * n_t
+    i_action = torch.div(token, block_a, rounding_mode="floor")
+    rem = token % block_a
+    i_side = torch.div(rem, block_s, rounding_mode="floor")
+    rem = rem % block_s
+    i_depth = torch.div(rem, block_d, rounding_mode="floor")
+    rem = rem % block_d
+    i_vol = torch.div(rem, n_t, rounding_mode="floor")
+    i_iat = rem % n_t
+    return i_action, i_side, i_depth, i_vol, i_iat
+
 
 def subtoken_factors(vocab_size: int) -> tuple[int, int, int, int, int]:
     """Infer (n_action, n_side, n_depth, n_volume, n_interarrival) from vocab.

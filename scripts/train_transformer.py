@@ -43,7 +43,7 @@ from tqdm import tqdm
 
 from src.config import ModelConfig
 from src.data.dataset import OrderFlowDataset
-from src.data.tokenizer import Tokenizer, subtoken_factors
+from src.data.tokenizer import Tokenizer, decompose_token_torch, subtoken_factors
 from src.eval.stylized_facts import compute_stylized_facts, run_rollout
 from src.training.muon import HybridMuonAdamW, split_params_for_muon
 from src.models.transformer import OrderFlowTransformer
@@ -308,27 +308,6 @@ def _run_stylized_fact_rollout(
           f"acf_r[1]={acf_r1:+.3f}, acf_|r|[1]={acf_a1:+.3f}")
 
 
-def _decompose_token(tok: torch.Tensor, factors: tuple[int, int, int, int, int]):
-    """Vectorized inverse of the mixed-base composite token (see tokenizer.py).
-
-    Returns a tuple (i_action, i_side, i_depth, i_volume, i_interarrival).
-    """
-    _n_a, n_s, n_d, n_v, n_t = factors
-    block_action = n_s * n_d * n_v * n_t
-    block_side = n_d * n_v * n_t
-    block_depth = n_v * n_t
-
-    i_action = torch.div(tok, block_action, rounding_mode="floor")
-    rem = tok % block_action
-    i_side = torch.div(rem, block_side, rounding_mode="floor")
-    rem = rem % block_side
-    i_depth = torch.div(rem, block_depth, rounding_mode="floor")
-    rem = rem % block_depth
-    i_vol = torch.div(rem, n_t, rounding_mode="floor")
-    i_iat = rem % n_t
-    return i_action, i_side, i_depth, i_vol, i_iat
-
-
 @torch.no_grad()
 def evaluate(
     model: nn.Module,
@@ -394,8 +373,8 @@ def evaluate(
 
         # Per-subtoken accuracy (decompose argmax pred + target).
         pred_tok = logits.argmax(dim=-1)
-        pred_comps = _decompose_token(pred_tok, factors)
-        true_comps = _decompose_token(target_tokens, factors)
+        pred_comps = decompose_token_torch(pred_tok, factors)
+        true_comps = decompose_token_torch(target_tokens, factors)
         for name, p_c, t_c in zip(component_names, pred_comps, true_comps):
             correct_sum[name] += (p_c == t_c).float().sum().item()
         n_positions += target_tokens.numel()
