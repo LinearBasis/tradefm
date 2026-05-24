@@ -1,87 +1,148 @@
-# Текущий запуск на кластере
+# Запуск TradeFM на кластере
 
-Цель: получить **сравнение baseline A-S (константы) vs наша модель A-S (μ/σ/κ от голов)** на SBER. Данные (`data/raw/*`, `data/hftbacktest/*.npz`) уже на кластере; здесь только код, конфиги и эта инструкция.
+Ветка: `cleared_tradefm`. Цель: натренировать декодер-only TradeFM на месяце MOEX-данных, замерить метрики paper'а (stylized facts, K-S, W₁).
 
 ## 0. Окружение
 
 ```bash
-tar xzf tradefm.tar.gz && cd tradefm
+git clone https://github.com/LinearBasis/tradefm.git && cd tradefm
+git checkout cleared_tradefm
 uv sync
-uv run python -c "import torch; print('cuda?', torch.cuda.is_available())"
+uv run python -c "import torch, numba; print('cuda?', torch.cuda.is_available(), '| numba', numba.__version__)"
 ```
 
-## 1. Регенерация sequences (~30–60 мин)
+Зависимости подтянутся из `pyproject.toml`. На H100 — `torch>=2.5` (нужно для `enable_gqa` в SDPA, и `torch.compile`'у на bf16).
 
-Старые таргеты были в **событиях**, новые — в **секундах** (`tau_sec=1.0`). Старый `data/processed/sequences/` несовместим и должен быть пересобран.
+## 1. Токенизация (~3–6 мин на месяц)
+
+Pipeline принимает `.csv`, `.txt`, `.parquet` в одном каталоге. EW-VWAP под `@njit` (×100 быстрее старого). Tokenizer состояние (edges + ADV + instruments list) сохраняется в `data/processed/tokenizer.json` для воспроизводимости.
 
 ```bash
-rm -rf data/processed/sequences
-uv run python -m src.data.pipeline --n-jobs 8 --polars-threads 4
+uv run python -m src.data.pipeline \
+    --raw-dir data/raw \
+    --output-dir data/processed \
+    --top-n-instruments 20 \
+    --n-jobs 8 --polars-threads 4
 ```
 
-## 2. Трансформер (4×H100)
+Артефакты:
+- `data/processed/sequences/<SECCODE>_<date>.parquet` — токенизированные последовательности (per-instrument per-day)
+- `data/processed/sequences/manifest.json` — train/val split, instruments
+- `data/processed/tokenizer.json` — self-contained tokenizer (edges + ADV + instruments + extents)
 
-Архитектура — Llama-family (GQA + SwiGLU + RoPE), повторяет концепции TradeFM paper. Два варианта размера; обучаем оба и сравним.
+Опциональные флаги:
+- `--reuse-tokenizer` — пропустить калибровку, грузить tokenizer из `data/processed/tokenizer.json` (для прогона того же набора инструментов на новых данных)
+- `--instruments "SBER,GAZP,LKOH"` — ручной whitelist вместо top-N
 
-**75M** (paper operating point ~72 tok/p на 4 эпохах, рекомендованный):
+## 2. Трансформер (8×H100)
+
+Production: **base_50m** (52M params, Muon hybrid, Llama-faithful: SwiGLU + d_ff=8/3·d_model + RMSNorm). Маленький вариант **base_20m** (19M) — для быстрых ablation-прогонов.
+
+**52M** (рекомендуемая точка):
 ```bash
 mkdir -p logs checkpoints
-CUDA_VISIBLE_DEVICES=0,1,2,3 uv run torchrun --standalone --nproc-per-node=4 \
-    -m scripts.train_transformer --config configs/base.json \
-    --num-workers 8 --amp bf16 --run-name xfmr_75m \
-    2>&1 | tee logs/xfmr_75m.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 uv run torchrun --standalone --nproc-per-node=8 \
+    -m scripts.train_transformer --config configs/base_50m.json \
+    --num-workers 8 --amp bf16 --run-name xfmr_50m \
+    2>&1 | tee logs/xfmr_50m.log
 ```
-Артефакт: `checkpoints/transformer_75m/best.pt`.
+Артефакт: `checkpoints/transformer_50m/best.pt`.
 
-**125M** (Chinchilla-friendly, ~43 tok/p на 4 эпохах):
+**19M** (быстрая итерация):
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 uv run torchrun --standalone --nproc-per-node=4 \
-    -m scripts.train_transformer --config configs/base_125m.json \
-    --num-workers 8 --amp bf16 --run-name xfmr_125m \
-    2>&1 | tee logs/xfmr_125m.log
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 uv run torchrun --standalone --nproc-per-node=8 \
+    -m scripts.train_transformer --config configs/base_20m.json \
+    --num-workers 8 --amp bf16 --run-name xfmr_20m \
+    2>&1 | tee logs/xfmr_20m.log
 ```
-Артефакт: `checkpoints/transformer_125m/best.pt`.
+Артефакт: `checkpoints/transformer_20m/best.pt`.
 
-При крэше — `--resume <checkpoint_dir>/last.pt`.
+При крэше — `--resume <checkpoint_dir>/last.pt`. Resume падает с понятной ошибкой, если число инструментов в данных отличается от чекпоинта.
 
-## 3. Decision heads (~часы)
-
-Учим μ/σ/κ поверх замороженного латента. `configs/base_heads.json` имеет `tau_sec=1.0`, должно совпадать с шагом 1. **Запустить отдельно для каждого трансформера** — в `base_heads.json` нужно прописать соответствующий `transformer_checkpoint` (или пробросить через CLI, если поддерживается).
-
-Если решишь обучать только под один трансформер — выбери лучший по val-loss трансформер из шага 2 и подсунь его в `transformer_checkpoint`.
-
-```bash
-# Пример для 75M трансформера (правь transformer_checkpoint в base_heads.json или клонируй конфиг)
-CUDA_VISIBLE_DEVICES=0,1,2,3 uv run torchrun --standalone --nproc-per-node=4 \
-    -m scripts.train_heads --config configs/base_heads.json \
-    --num-workers 8 --amp bf16 --run-name heads_75m \
-    2>&1 | tee logs/heads_75m.log
-```
-
-Артефакт: `checkpoints/heads/best_heads.pt`. **Главные метрики в логах:** `IC(α)`, `Spearman(σ)`, `Spearman(κ)`, `α_pred_std`. Если `IC(α) ≈ 0` и `α_pred_std → 0` — α-голова коллапсировала, в бэктесте её можно игнорировать.
-
-## 4. Бэктесты — оба варианта на одном окне
-
-Сравниваем на **SBER, 2024-03-22, минуты 60–120**.
+**Что мониторить в TensorBoard:**
+- `train/loss_step`, `loss/epoch` — должна идти к 4–5 (старт у ln(16384) ≈ 9.7)
+- `eval/acc_{action,side,depth,vol,iat}` — per-subtoken accuracy. action/side стартуют от 0.5 (random на бинарных), depth/vol/iat от 0.0625 (random на 16-way). Все 5 должны оторваться к 5–10 эпохе.
+- `rollout/{kurtosis_10s,acf_returns_lag1,acf_abs_returns_lag1}` — приходит каждые `rollout_every_n_epochs` эпох (если включён в конфиге). ACF(returns) lag1 должен идти к 0, ACF(|returns|) — оставаться ≥0.3.
 
 ```bash
-# Baseline: A-S с константами
-PYTHONPATH=. uv run python -m scripts.backtest_orig_as \
-    --instrument SBER --date 2024-03-22 --interval 60-120
-
-# Наша модель
-PYTHONPATH=. uv run python -m scripts.backtest_our_as \
-    --transformer-checkpoint checkpoints/transformer/best.pt \
-    --heads-checkpoint checkpoints/heads/best_heads.pt \
-    --instrument SBER --date 2024-03-22 --interval 60-120
+tensorboard --logdir runs/ --port 6006 --bind_all
 ```
 
-Результаты: `runs/backtest_orig_as/SBER_2024-03-22_060-120/summary.json` и `runs/backtest_our_as/SBER_2024-03-22_060-120/summary.json`. Ключевые поля для сравнения: `pnl`, `n_fills`, `mean_position`, `max_abs_position`.
+## 3. Eval — closed-loop rollout + stylized facts (~10–30 мин)
+
+Standalone-тулза, можно гонять на любом чекпоинте. Поддерживает single-инструмент и `--all-instruments` для sweep.
+
+**Sweep по всем инструментам:**
+```bash
+uv run python -m scripts.eval_rollout \
+    --checkpoint checkpoints/transformer_50m/best.pt \
+    --tokenizer data/processed/tokenizer.json \
+    --val-sequences data/processed/sequences \
+    --all-instruments \
+    --n-rollouts 10 --n-events 1024 \
+    --init-mid 250.0 \
+    --output runs/eval/xfmr_50m_best \
+    --device cuda
+```
+
+**Один инструмент** (для дебага):
+```bash
+uv run python -m scripts.eval_rollout \
+    --checkpoint checkpoints/transformer_50m/best.pt \
+    --tokenizer data/processed/tokenizer.json \
+    --val-sequences data/processed/sequences \
+    --instrument SBER \
+    --n-rollouts 10 --n-events 1024 \
+    --init-mid 250.0 \
+    --output runs/eval/xfmr_50m_SBER \
+    --device cuda
+```
+
+Артефакт: `runs/eval/<name>/metrics.json` + TensorBoard events.
+
+**Ориентиры для сравнения с paper (Table 2, 3):**
+- `aggregated/overall/distributional_fidelity/iat/ks`: paper TradeFM-500M = **0.281**, Hawkes-baseline = 0.515
+- `aggregated/overall/distributional_fidelity/depth/ks`: paper = **0.169**, Hawkes = 0.281
+- `aggregated/overall/stylized_facts/kurtosis_10s`: real ≈ 80, paper TradeFM ≈ 60, random модель ≈ 6
+- `aggregated/overall/stylized_facts/acf_abs_returns_lag1`: real ≈ 0.4 (volatility clustering), random ≈ 0
+
+## 4. Cross-dataset reuse (новый месяц → существующий чекпоинт)
+
+Tokenizer self-contained → переносим и применяем без повторной калибровки.
+
+```bash
+# На машине A — токенизируем март, тренируем
+uv run python -m src.data.pipeline --raw-dir march_data --output-dir march_proc
+# ... train as in §2 ...
+
+# Переносим артефакты
+scp march_proc/tokenizer.json B:/data/april_proc/tokenizer.json
+scp checkpoints/transformer_50m/best.pt B:/checkpoints/
+
+# На машине B — апрель с reuse'ом tokenizer'а из марта
+uv run python -m src.data.pipeline \
+    --raw-dir april_data --output-dir /data/april_proc \
+    --reuse-tokenizer
+# → пропускает калибровку, использует инструменты + bin edges + ADV из марта
+# → WARNING если каких-то инструментов нет в апреле
+
+uv run python -m scripts.eval_rollout \
+    --checkpoint /checkpoints/best.pt \
+    --tokenizer /data/april_proc/tokenizer.json \
+    --val-sequences /data/april_proc/sequences \
+    --all-instruments --n-rollouts 10 --n-events 1024 \
+    --output runs/eval/april/
+# → проверит, что tokenizer.instruments == manifest.instruments == cfg.n_instruments
+# → упадёт с понятной ошибкой при рассинхроне
+```
 
 ## Подводные камни
 
-- **LR vs число GPU**: `configs/base.json` имеет `lr=3e-4` под 1 GPU. На 4 GPU эффективный батч ×4. При нестабильном loss в первые шаги — снизить до `1e-4`; если кривая слишком плоская — поднять до `6e-4`.
-- **OOM** → уменьшить `batch_size` в конфиге (64 → 32) или `context_length` (1024 → 512).
-- **`num_workers` ≥ 8** — иначе DataLoader станет горлышком.
-- **bf16** бесплатный на H100 — оставлять.
-- **hftbacktest npz** должны лежать в `data/hftbacktest/{SECCODE}/{date}.npz`. Если их нет: `uv run python -m src.data.moex_to_hftbacktest --output-dir data/hftbacktest`.
+- **`--num-workers ≥ 8`** — иначе DataLoader станет горлышком на H100.
+- **bf16 бесплатный на H100** — оставлять. fp16 включать только при OOM (нужен GradScaler).
+- **OOM** → уменьшить `batch_size` в конфиге (64 → 32) или включить gradient checkpointing (не реализовано как флаг, потребует ручной правки PreNormBlock через `torch.utils.checkpoint.checkpoint`).
+- **LR vs число GPU**: `cfg.lr=3e-4` под per-rank batch=64. На 8 GPU effective_batch=512. При нестабильном loss в первые шаги — снизить до `1e-4`; если кривая плоская — поднять до `6e-4`. Muon-сторона `muon_lr=0.02` отдельно — её обычно не трогать.
+- **Rollout-хук в обучении** включается через `cfg.rollout_every_n_epochs > 0` (default 0 = off). Запускается **только на rank 0**, остальные ранги ждут — на 50M модели с `n_events=512 × n_rollouts=3` это ~30–60 сек простоя 7 GPU раз в N эпох. Ставить N ≥ 5.
+- **Numba первый раз компилит EW-VWAP** ~1 сек в первом воркере (`cache=True` пишет в `__pycache__/`, остальные воркеры читают). Не пугаться.
+- **Чекпоинты несовместимы между разными `n_instruments`**: train_transformer и eval_rollout явно падают при mismatch. Чтобы перенести модель на новый набор инструментов — `--reuse-tokenizer` (см. §4) или train from scratch.
+- **Если grad clip ловит inf/nan** — посмотреть `train/lr` (warmup не должен дать step LR на первой итерации), затем уменьшить `muon_update_rescale` с 0.2 до 0.1.
