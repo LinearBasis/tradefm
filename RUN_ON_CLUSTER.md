@@ -38,6 +38,8 @@ uv run python -m src.data.pipeline \
 
 Production: **base_50m** (52M params, Muon hybrid, Llama-faithful: SwiGLU + d_ff=8/3·d_model + RMSNorm). Маленький вариант **base_20m** (19M) — для быстрых ablation-прогонов.
 
+Оба конфига включают `use_compile: true` (`torch.compile` через TorchDynamo+Inductor → fused Triton-ядра, +30–80% throughput на H100), `enable_gqa=True` в SDPA (избегает материализации K/V), и `AdamW(fused=True)` (один CUDA-kernel на optimizer.step). Все три — silent fallback на CPU/MPS.
+
 **52M** (рекомендуемая точка):
 ```bash
 mkdir -p logs checkpoints
@@ -58,6 +60,8 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 uv run torchrun --standalone --nproc-per-no
 Артефакт: `checkpoints/transformer_20m/best.pt`.
 
 При крэше — `--resume <checkpoint_dir>/last.pt`. Resume падает с понятной ошибкой, если число инструментов в данных отличается от чекпоинта.
+
+`torch.compile` можно временно выключить флагом `--no-compile` (полезно при дебаге — eager-режим даёт читаемые tracebacks). Первый forward с компиляцией ~30–90 сек, дальше кешируется в `__pycache__/`. Чекпоинты сохраняются с «голыми» state_dict-ключами (без `_orig_mod.`/`module.` префиксов), поэтому совместимы между compiled/eager/DDP-режимами.
 
 **Что мониторить в TensorBoard:**
 - `train/loss_step`, `loss/epoch` — должна идти к 4–5 (старт у ln(16384) ≈ 9.7)
