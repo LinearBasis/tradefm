@@ -24,6 +24,9 @@ data.csv
 /tradefm_code.zip*
 /tradefm.zip*
 
+# Local-only docs (not part of distributed code)
+/RUN_ON_CLUSTER.md
+
 # OS
 .DS_Store
 
