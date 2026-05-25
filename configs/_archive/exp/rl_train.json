@@ -1,9 +1,0 @@
-{
-  "seed": 0,
-  "n_rollouts": 30,
-  "updates_per_step": 1,
-  "log_dir": "runs/rl",
-  "log_every_steps": 200,
-  "eval_every_rollouts": 5,
-  "save_every_rollouts": 10
-}
