@@ -1,0 +1,12 @@
+# Минимальный набор зависимостей. Тестировалось на Python 3.12.
+torch>=2.1
+numpy>=1.26
+pandas>=2.0
+polars>=1.0
+tqdm>=4.66
+huggingface-hub>=0.20
+
+# Опционально: numba ускоряет компиляцию EW-VWAP при подготовке эмбеддингов
+# TradeFM (см. tradefm/src/data/features.py). Без неё используется
+# чисто-Python fallback — корректность та же, но дольше.
+numba>=0.59
